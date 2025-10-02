@@ -1,0 +1,68 @@
+---
+- name: Remove files if exsists
+  win_file:
+    path: d:\downloads\Oracle\ODAC\
+    state: absent
+
+- name: Copy ODAC install to d:\downloads
+  win_copy:
+      src: ODAC-21.7-Xcopy-64-bit.zip
+      dest: D:\downloads\Oracle\ODAC\
+
+- name: Extract the zip file
+  win_unzip:
+    src: d:\downloads\Oracle\ODAC\ODAC-21.7-Xcopy-64-bit.zip
+    dest: d:\downloads\Oracle\ODAC\
+    delete_archive: yes
+
+- name: Check if ODAC64 directory exists
+  win_stat:
+    path: d:\Oracle\ODAC64
+  register: odac64_dir 
+
+- name: Backup ODAC64 directory if it exists
+  win_command: powershell -command "Rename-Item -Path 'D:\Oracle\ODAC64' -NewName ('ODAC64_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))"
+  when: odac64_dir.stat.exists
+
+- name: Run the install for ODAC
+  win_command:  .\install.bat oledb D:\Oracle\ODAC64 odac64 true
+  args:
+     chdir: d:\downloads\Oracle\ODAC\ODAC-21.7-Xcopy-64-bit\
+
+- name: copy ldap.ora file to host
+  win_copy:
+      src: ldap.ora
+      dest: d:\Oracle\ODAC64\network\admin\
+      force: yes
+- name: copy sqlnet.ora file to host
+  win_copy:
+      src: sqlnet.ora
+      dest: d:\Oracle\ODAC64\network\admin\
+      force: yes
+- name: copy tnsnames.ora to host
+  win_copy:
+      src: tnsnames.ora
+      dest: d:\Oracle\ODAC64\network\admin\
+      force: yes
+
+- name: Ensure ODAC64 exsists in Environment Path
+  win_path:
+    elements:
+      - 'D:\Oracle\ODAC64'
+      - 'D:\Oracle\ODAC64\bin'
+
+- name: Set to allow in process
+  win_shell: |
+      $ErrorActionPreference = "Stop";
+        try{Import-Module SQLPS}
+        catch{
+          Add-PSSnapin SqlServerCmdletSnapin100
+          Add-PSSnapin SqlServerProviderSnapin100
+          }
+      $server = "{{ item }}"
+        Invoke-Sqlcmd -ServerInstance $server -Query "exec master.dbo.sp_MSset_oledb_prop N'OraOLEDB.Oracle', N'AllowInProcess', 1"
+  register: odac_results
+  # no_log: true
+  with_items: "{{hostvars[inventory_hostname]['instances']}}"
+  when:
+    - item != "NoSQLOnline"

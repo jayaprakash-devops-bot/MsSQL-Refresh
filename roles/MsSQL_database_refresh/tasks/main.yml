@@ -1,0 +1,6 @@
+---
+- name: start database refresh
+  block:
+    - name: CyberArk credentials
+      include_role:
+        name: CyberArk

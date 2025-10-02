@@ -1,0 +1,63 @@
+The tower job id is {{ tower_job_id }}.
+
+{# Improved error checking - consider using 'failed' state variable instead of string matching #}
+{% if ('failed' in log_msg) or ('Failed' in log_msg) %}
+***** There was an error - review attached log file for details *****
+{% endif %}
+
+{# Consider using boolean true/false instead of string comparisons #}
+{% if dry_run == 'true' %}
+This was a dry run for testing!
+{% endif %}
+{% if refreshonly == 'true' %}
+This was executed as a refresh only.
+{% else %}
+This was executed as a migrate/upgrade.
+{% endif %}
+
+The backup type chosen was: {{ restore_type }}
+{% if restore_type == 'Point In Time (Requires Stop at Parameter)' %}
+The restore point is: {{ stop_at_cst }}
+{% endif %}
+
+{% if rejoin_ag == 'true' %}
+The database {{ dest_database }} will be rejoined to {{ ag_name }} and a detailed results email sent.
+{% else %}
+This will not be added to an AG.
+{% endif %} 
+
+Results of refreshing {{ dest_database }} on {{ dest_instance }} with {{ src_database }} from {{ src_instance }}.
+
+{# Verify these variables are defined in all execution paths #}
+The default backup location is {{ default_backup_loc_output.stdout | basename }}
+The last full backup found was {{ physical_device_name_full }} - age {{ age_hours_full }} hrs.
+The last differential backup found was {{ physical_device_name_diff }} - age {{ age_hours_diff }} hrs.
+
+File Mappings:
+- Source:
+{% if src_database_files is defined %}
+{% for key, value in src_database_files.items() %}
+   - {{ key }}: {{ value }}
+{% endfor %}
+{% else %}
+   - No source files mapped
+{% endif %}
+- Destination:
+{% if dest_database_files is defined %}
+{% for key, value in dest_database_files.items() %}
+   - {{ key }}: {{ value }}
+{% endfor %}
+{% else %}
+   - No destination files mapped
+{% endif %}
+
+The refresh script that was generated is:
+{{ restore_script }}
+
+Security Scripts are attached.
+
+{# Commented out error section - appears to be PowerShell attachment errors
+[31;1mNew-Object: [0m
+...
+[31;1mException calling "Add" with "1" argument(s): "Value cannot be null. (Parameter 'item')"[0m
+#}

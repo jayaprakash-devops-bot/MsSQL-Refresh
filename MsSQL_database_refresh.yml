@@ -1,0 +1,11 @@
+- name: MsSQL database refresh
+  hosts: "{{ ctrl_server }}"
+  gather_facts: true
+  vars:
+    dry_run: true
+    log_msg: "{{ '%Y-%m-%d %H:%M:%S' | strftime }} Starting the database restore/migration "  
+    paths_attach: []
+    ag_name: "No AG was defined"
+    isContained: false
+  roles:
+  - MsSQL_database_refresh

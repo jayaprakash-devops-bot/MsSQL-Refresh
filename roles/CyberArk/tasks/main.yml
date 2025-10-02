@@ -1,0 +1,15 @@
+---
+- name: retrieve cred for sql_usr
+  cyberark.pas.cyberark_credential:
+    api_base_url: "https://cyberarkccp"
+    app_id: "Ansible_MSSQL"
+    query: "safe=ET_Ansible_MSSQL;UserName=svc_sqlAvia;Address=local"
+    validate_certs: no
+  register: pwd  
+  delegate_to: localhost
+  no_log: true
+
+- name: set password
+  set_fact:
+    sql_pwd:  "{{ pwd.result.Content }}"
+  no_log: true

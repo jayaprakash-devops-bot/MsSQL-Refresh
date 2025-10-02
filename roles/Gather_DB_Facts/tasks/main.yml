@@ -1,0 +1,424 @@
+---
+# Gater_Facts
+
+- name: include vars
+  ansible.builtin.include_vars:
+    file: vars.yml
+
+- name: chcek IsHA on destination
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
+    Write-Output $($output.IsHa)
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  vars:
+    tsql_query: "select convert(bit,isnull(serverproperty ('IsHADREnabled'), 0)) as IsHa"
+  register: IsHA_dest_result
+  when: refreshonly | bool
+  no_log: true
+
+- set_fact:
+    Is_HA_dest: "{{ IsHA_dest_result.stdout }}"
+
+- debug:
+    var: Is_HA_dest
+
+- name: chcek IsHA on source
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
+    Write-Output $($output.IsHa)
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  vars:
+    tsql_query: "select convert(bit,isnull(serverproperty ('IsHADREnabled'), 0)) as IsHa"
+  register: IsHA_src_result
+  when: refreshonly | bool
+  no_log: true
+
+- set_fact:
+    Is_HA_src: "{{ IsHA_src_result.stdout }}"
+
+- debug:
+    var: Is_HA_src
+
+- name: Check if IsDBHA on source
+  shell: |
+        $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
+        Write-Output $($output.Column1)
+  args:
+    executable: pwsh
+  vars: 
+    tsql_query: "declare @IsDBHA bit
+                  select  @IsDBHA = 
+                  case when database_name is not null then 1 else 0 end 
+                  FROM sys.dm_hadr_availability_group_states ags
+                  left outer JOIN master.sys.availability_groups ag ON ags.group_id = ag.group_id
+                  left JOIN sys.availability_databases_cluster agd ON ag.group_id = agd.group_id
+                  WHERE primary_replica = @@Servername
+                  and database_name = '{{ src_database }}'
+                  select isnull(@IsDBHa, 0)"
+  delegate_to: localhost   
+  register: IsDBHA_src_result
+  when: refreshonly | bool
+  no_log: true
+
+- set_fact:
+    Is_DBHA_src: "{{ IsDBHA_src_result.stdout }}"
+
+- debug:  
+    var: Is_DBHA_src
+
+- name: Gather AG details for source (if Is_DBHA_src is True)
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
+    Write-Output $($output.name)
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: |
+      select
+        ag.name 
+      FROM
+        sys.dm_hadr_availability_group_states ags
+      left
+        outer JOIN master.sys.availability_groups ag ON ags.group_id = ag.group_id
+      left
+        JOIN sys.availability_databases_cluster agd ON ag.group_id = agd.group_id
+      WHERE
+        primary_replica = @@Servername
+        and database_name = '{{ src_database }}'
+  delegate_to: localhost
+  register: ag_details_src
+  no_log: true
+  when: Is_DBHA_src | bool
+
+- set_fact:
+    src_ag_name: "{{ ag_details_src.stdout }}"
+  when: 
+    - Is_DBHA_src | bool
+
+- debug: 
+    var: src_ag_name
+  when: 
+    - Is_DBHA_src | bool
+
+- name: Check if IsDBHA on destination
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    Write-Output $($output.Column1)
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: "declare @IsDBHA bit
+                  select  @IsDBHA = 
+                  case when database_name is not null then 1 else 0 end 
+                  FROM sys.dm_hadr_availability_group_states ags
+                  left outer JOIN master.sys.availability_groups ag ON ags.group_id = ag.group_id
+                  left JOIN sys.availability_databases_cluster agd ON ag.group_id = agd.group_id
+                  WHERE primary_replica = @@Servername
+                  and database_name = '{{ dest_database }}'
+                  select isnull(@IsDBHa, 0)"
+  delegate_to: localhost
+  register: IsDBHA_dest_result
+  when: refreshonly | bool
+  no_log: true
+
+- set_fact:
+    Is_DBHA_dest: "{{ IsDBHA_dest_result.stdout }}"
+- debug:
+    var: Is_DBHA_dest
+
+- name: gather ag details for destination
+  shell: |
+        $output = Invoke-sqlcmd -TrustServerCertificate  -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -QueryTimeout 60 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
+        Write-Output $output | Select-Object name,agtype,agname,listener | ConvertTo-Json -Compress
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  vars:
+    tsql_query: |
+      SELECT DISTINCT sd.name, (CASE WHEN hdrs.is_primary_replica IS NULL THEN 'NOT REPLICATED' WHEN EXISTS
+                                  (SELECT        *
+                                    FROM            sys.dm_hadr_database_replica_states AS irs
+                                    WHERE        sd.database_id = irs.database_id AND is_primary_replica = 1) 
+        THEN 'PRIMARY' ELSE 'SECONDARY' END) AS agtype, COALESCE (grp.ag_name, 'N/A') AS agname, 
+        CAST(ag_listener.dns_name as Varchar(64)) + ',' + CAST(ag_listener.port as varchar(24)) as listener
+      FROM            sys.availability_group_listeners AS ag_listener RIGHT OUTER JOIN
+                              sys.dm_hadr_name_id_map AS grp ON ag_listener.group_id = grp.ag_id RIGHT OUTER JOIN
+                              sys.databases AS sd LEFT OUTER JOIN 
+                              sys.dm_hadr_database_replica_states AS hdrs ON hdrs.database_id = sd.database_id ON grp.ag_id = hdrs.group_id
+                              where sd.name = '{{ dest_database }}'
+  register: ag_details_dest
+  when: 
+    - refreshonly | bool
+  no_log: true
+
+- name: set log message
+  set_fact:
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' AG Details for ' + ag_details_dest.stdout }}"
+  when:
+    - refreshonly | bool
+    - ag_details_dest is defined
+
+- name: set ag details    
+  set_fact:
+    ag_details: "{{ ag_details_dest.stdout }}"
+  when:
+    - refreshonly | bool
+    - ag_details_dest is defined
+  ignore_errors: true
+
+- set_fact:
+    Dest_ag_name: "{{ ag_details.agname }}"
+    listener_name:  "{{ ag_details.listener }}"
+    db_list: "{{ ag_details.name }}"
+  when:
+    - refreshonly | bool
+    - ag_details_dest is defined
+
+- debug:
+    var: Dest_ag_name
+  when:
+    - refreshonly | bool
+    - ag_details_dest is defined
+
+- name: check for contained availability group    
+  win_shell:  |
+    $Output = Invoke-Sqlcmd -Query "{{ ag.contained }}" -QueryTimeout 0 -ServerInstance "{{ dest_instance }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    $Output | Select-Object -ExpandProperty value
+  delegate_to: '{{ ctrl_server }}'
+  register: Dest_Contained_AG
+  no_log: true
+
+- name: set fact for contained AG
+  set_fact:
+    ISContained_Dest: "{{ Dest_Contained_AG.stdout | trim}}"
+    log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' is contained availability group: ' + Dest_Contained_AG.stdout }}"
+  ignore_errors: true
+
+- debug:
+    var: ISContained_Dest
+
+- name: Gather primary node for source (if IsHA_src and IsDBHA_src are True)
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    Write-Output $($output.Replica) 
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: |
+      ; with AGNodes as (
+          select upper(replica_server_name) as Replica, 
+          role_desc as AGRole
+          from sys.dm_hadr_availability_replica_states ars
+          inner join sys.availability_groups ag on ars.group_id = ag.group_id
+          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
+          where ag.name = '{{ src_ag_name }}'
+      )
+      select Replica 
+      from AGNodes
+      where AGRole = 'Primary'
+      order by Replica
+  delegate_to: localhost
+  no_log: true
+  register: primary_secondary_src
+  when: 
+    - Is_HA_src | bool
+    - Is_DBHA_src | bool
+
+- set_fact:
+    Primary_src_node: "{{ primary_secondary_src.stdout }}"
+  when:
+    - Is_HA_src | bool
+    - Is_DBHA_src | bool
+    
+- set_fact:
+    Primary_src_node: "{{ src_instance }}"
+  when:
+    - src_ag_name is not defined
+
+- name: Gather secondary node for source (if IsHA_src and IsDBHA_src are True)
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    Write-Output $($output.Replica)
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: |
+      ; with AGNodes as (
+          select upper(replica_server_name) as Replica, 
+                case when failover_mode_desc = 'Manual' then 'BCC' else role_desc end as AGRole
+          from sys.dm_hadr_availability_replica_states ars
+          inner join sys.availability_groups ag on ars.group_id = ag.group_id
+          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
+          where ag.name = '{{ src_ag_name }}'
+      )
+      select Replica 
+      from AGNodes
+      where AGRole = 'Secondary'
+      order by Replica
+  delegate_to: localhost
+  no_log: true
+  register: secondary_secondary_src
+  when: 
+    - Is_HA_src | bool
+    - Is_DBHA_src | bool
+
+- set_fact:
+    Secondary_src_node: "{{ secondary_secondary_src.stdout }}"
+  when: 
+    - Is_HA_src | bool
+    - Is_DBHA_src | bool
+
+- debug:
+    var: Primary_src_node
+
+- debug:
+    var: Secondary_src_node
+  when: 
+    - Is_HA_src | bool
+    - Is_DBHA_src | bool
+
+- name: Gather primarynode for destination (if IsHA_dest and IsDBHA_dest are True)
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    Write-Output $($output.Replica)
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: |
+      ; with AGNodes as (
+          select upper(replica_server_name) as Replica, 
+          role_desc as AGRole
+          from sys.dm_hadr_availability_replica_states ars
+          inner join sys.availability_groups ag on ars.group_id = ag.group_id
+          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
+          where ag.name = '{{ Dest_ag_name }}'
+      )
+      select Replica 
+      from AGNodes
+      where AGRole = 'Primary'
+      order by Replica
+  delegate_to: localhost
+  no_log: true
+  register: primary_secondary_dest
+  when: 
+    - Is_HA_dest | bool
+    - Is_DBHA_dest | bool
+
+- set_fact:
+    Primary_dest_node: "{{ primary_secondary_dest.stdout }}"
+  when: 
+    - Is_HA_dest | bool
+    - Is_DBHA_dest | bool
+
+- name: Gather primarynode for destination (Dest_ag_name == 'N/A')
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    Write-Output $($output.Replica)
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: |
+      ; with AGNodes as (
+          select upper(replica_server_name) as Replica, 
+          role_desc as AGRole
+          from sys.dm_hadr_availability_replica_states ars
+          inner join sys.availability_groups ag on ars.group_id = ag.group_id
+          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
+          where ag.name = '{{ Dest_ag_name }}'
+      )
+      select Replica 
+      from AGNodes
+      where AGRole = 'Primary'
+      order by Replica
+  delegate_to: localhost
+  no_log: true
+  register: primary_secondary_dest_NoAG
+  when: 
+    - Dest_ag_name == 'N/A'
+
+- set_fact:
+    Primary_dest_node: "{{ primary_secondary_dest_NoAG.stdout }}"
+  when: 
+    - Dest_ag_name == 'N/A'
+
+- set_fact:
+    Primary_dest_node: "{{ dest_instance }}"
+  when:
+    - primary_secondary_dest_NoAG is not defined
+
+- set_fact:
+    Primary_dest_node: "{{ dest_instance }}"
+  when:
+    - Dest_ag_name == 'N/A'
+
+- name: Gather secondary node for destination (if IsHA_dest and IsDBHA_dest are True)
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    Write-Output $($output.Replica)
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: |
+      ; with AGNodes as (
+          select upper(replica_server_name) as Replica, 
+                case when failover_mode_desc = 'Manual' then 'BCC' else role_desc end as AGRole
+          from sys.dm_hadr_availability_replica_states ars
+          inner join sys.availability_groups ag on ars.group_id = ag.group_id
+          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
+          where ag.name = '{{ Dest_ag_name }}'
+      )
+      select Replica
+      from AGNodes
+      where AGRole = 'Secondary'
+      order by Replica
+  delegate_to: localhost
+  no_log: true
+  register: secondary_secondary_dest
+  when: 
+    - Is_HA_dest | bool
+    - Is_DBHA_dest | bool
+
+- set_fact:
+    Secondary_dest_node: "{{ secondary_secondary_dest.stdout }}"
+  when: 
+    - Is_HA_dest | bool
+    - Is_DBHA_dest | bool
+
+- debug:
+    var: Primary_dest_node
+
+- debug:
+    var: Secondary_dest_node
+  when:
+    - Is_HA_dest | bool
+    - Is_DBHA_dest | bool
+
+- name: Check connection to destination Server Instance when Non-AG
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    Write-Output $output
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: |
+      SELECT @@SERVERNAME AS ServerName;
+  delegate_to: localhost
+  when: Dest_ag_name == 'N/A'
+  no_log: true
+
+- name: Check connection to source Server Instance when Non-AG
+  shell: |
+    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
+    Write-Output $output
+  args:
+    executable: pwsh
+  vars:
+    tsql_query: |
+      SELECT @@SERVERNAME AS ServerName;
+  delegate_to: localhost
+  when: Dest_ag_name == 'N/A'
+  no_log: true

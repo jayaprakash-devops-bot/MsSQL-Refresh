@@ -1,0 +1,17 @@
+---
+# inventory vars
+ansible_port: 5986
+ansible_connection: winrm
+ansible_winrm_server_cert_validation: ignore
+ansible_winrm_scheme: https
+ansible_winrm_transport: kerberos
+smtp_server: appmailmo.energy.sug.pri
+# ctrl_server: GTHOU-APFOG04D.energy.sug.pri
+ctrl_server: CETHOU-SQATM01P.energy.sug.pri
+ansible_user: svc_sqlAvia@ENERGY.SUG.PRI
+sql_usr: svc_sqlAvia
+
+# encrypted vars
+ansible_password: "{{ vault_ansible_password }}" 
+
+

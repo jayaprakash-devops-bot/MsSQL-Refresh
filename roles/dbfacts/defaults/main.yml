@@ -1,0 +1,5 @@
+online_only: false
+psScript: "get_instance_details.ps1"
+srcdatabase:
+instance:
+destdatabase:

@@ -1,0 +1,30 @@
+key: 
+exec_sql_user: false
+append_result: false
+appended_result: []
+scalar_return: 
+db_name:
+encrypt_state:
+# port:
+sql_version:
+inst_name:
+time_string: "{{ '%Y_%m_%d_%H%M%S' | strftime }}"
+ag:
+  contained: | 
+    IF EXISTS (SELECT * FROM sys.availability_groups WHERE name = '{{ ag_details.agname }}' AND COLUMNPROPERTY(object_id('sys.availability_groups'), 'is_contained', 'ColumnId') IS NOT NULL)
+    SELECT 'true' as value
+    ELSE
+    SELECT 'false' as value;
+  primary_instance: |
+    SELECT
+        RCS.replica_server_name as Value
+      FROM
+      sys.availability_groups_cluster AS AGC
+        INNER JOIN sys.dm_hadr_availability_replica_cluster_states AS RCS ON
+          RCS.group_id = AGC.group_id
+        INNER JOIN sys.dm_hadr_availability_replica_states AS ARS ON
+          ARS.replica_id = RCS.replica_id
+        INNER JOIN sys.availability_group_listeners AS AGL ON
+          AGL.group_id = ARS.group_id
+      WHERE
+      ARS.role_desc = 'PRIMARY' AND AGC.name = '{{ ag_details.agname }}'

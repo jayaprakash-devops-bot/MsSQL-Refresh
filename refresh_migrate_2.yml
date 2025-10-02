@@ -1,0 +1,20 @@
+---
+- hosts: "{{ ctrl_server }}"
+  gather_facts: false
+
+  tasks:
+    - name: ag_resync_db
+      include_role:
+        name: ag_resync_db
+      when: 
+        - rejoin_ag | bool
+        - Dest_ag_name != "N/A"
+    
+# - import_playbook: ag_resync_db.yml
+#   when: 
+#     - rejoin_ag | bool
+#     - Dest_ag_name != "N/A"
+
+# - import_playbook: ag_resync_db.yml
+#   when: (rejoin_ag | bool) and ag_details.agname != "N/A"
+
