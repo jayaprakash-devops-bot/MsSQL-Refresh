@@ -1,0 +1,1 @@
+SELECT CASE WHEN DB_ID(%(database_name)s) IS NULL THEN 0 ELSE 1 END AS exists_flag;

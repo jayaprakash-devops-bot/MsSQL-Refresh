@@ -1,63 +1,47 @@
 The tower job id is {{ tower_job_id }}.
 
-{# Improved error checking - consider using 'failed' state variable instead of string matching #}
-{% if ('failed' in log_msg) or ('Failed' in log_msg) %}
+{% if 'failed' in log_msg or 'Failed' in log_msg %}
 ***** There was an error - review attached log file for details *****
 {% endif %}
 
-{# Consider using boolean true/false instead of string comparisons #}
-{% if dry_run == 'true' %}
-This was a dry run for testing!
+{% if (dry_run | string) == 'true' %}
+This was executed in dry-run mode.
 {% endif %}
-{% if refreshonly == 'true' %}
-This was executed as a refresh only.
+{% if (refreshonly | string) == 'true' %}
+This run refreshed the existing destination database.
 {% else %}
-This was executed as a migrate/upgrade.
+This run performed a full migration.
 {% endif %}
 
 The backup type chosen was: {{ restore_type }}
-{% if restore_type == 'Point In Time (Requires Stop at Parameter)' %}
-The restore point is: {{ stop_at_cst }}
+{% if restore_type == 'Point In Time (Requires Stop at Parameter)' and stop_at is defined %}
+The requested stop-at time was {{ stop_at }}.
 {% endif %}
 
-{% if rejoin_ag == 'true' %}
-The database {{ dest_database }} will be rejoined to {{ ag_name }} and a detailed results email sent.
+Availability Group summary:
+- Target AG name: {{ refresh_context.target.ag_name | default('N/A') }}
+- Rejoin method selected: {{ refresh_context.actions.rejoin_method | default('none') }}
+- Remove-from-AG performed: {{ refresh_context.actions.remove_dest_from_ag | default(false) }}
+
+Backup details:
+{% set full_backup = refresh_context.restore.full_backup | default({}) %}
+{% if full_backup %}
+- Last full backup: {{ full_backup.physical_device_name }} ({{ full_backup.backup_finish_date }}) on {{ full_backup.node }}
 {% else %}
-This will not be added to an AG.
-{% endif %} 
-
-Results of refreshing {{ dest_database }} on {{ dest_instance }} with {{ src_database }} from {{ src_instance }}.
-
-{# Verify these variables are defined in all execution paths #}
-The default backup location is {{ default_backup_loc_output.stdout | basename }}
-The last full backup found was {{ physical_device_name_full }} - age {{ age_hours_full }} hrs.
-The last differential backup found was {{ physical_device_name_diff }} - age {{ age_hours_diff }} hrs.
-
-File Mappings:
-- Source:
-{% if src_database_files is defined %}
-{% for key, value in src_database_files.items() %}
-   - {{ key }}: {{ value }}
-{% endfor %}
-{% else %}
-   - No source files mapped
+- No full backup metadata captured
 {% endif %}
-- Destination:
-{% if dest_database_files is defined %}
-{% for key, value in dest_database_files.items() %}
-   - {{ key }}: {{ value }}
-{% endfor %}
-{% else %}
-   - No destination files mapped
+{% set diff_backup = refresh_context.restore.diff_backup | default({}) %}
+- Differential backup available: {{ (diff_backup != {}) and (refresh_context.source.diff_backup_valid | default(false)) }}
+{% if diff_backup %}
+  Source: {{ diff_backup.physical_device_name }} ({{ diff_backup.backup_finish_date }}) on {{ diff_backup.node }}
 {% endif %}
 
-The refresh script that was generated is:
-{{ restore_script }}
+Execution endpoints:
+- Source primary replica: {{ refresh_context.source.primary_replica | default(src_instance) }}
+- Destination primary replica: {{ refresh_context.target.primary_replica | default(dest_instance) }}
+- Listener endpoint: {{ refresh_context.target.listener | default('n/a') }}
 
-Security Scripts are attached.
+Security artifacts were captured and attached.
 
-{# Commented out error section - appears to be PowerShell attachment errors
-[31;1mNew-Object: [0m
-...
-[31;1mException calling "Add" with "1" argument(s): "Value cannot be null. (Parameter 'item')"[0m
-#}
+Restore script excerpt:
+{{ restore_script | truncate(4000, True, '...') }}

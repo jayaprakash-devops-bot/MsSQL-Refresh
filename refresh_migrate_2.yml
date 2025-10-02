@@ -1,20 +1,13 @@
+
 ---
 - hosts: "{{ ctrl_server }}"
   gather_facts: false
 
   tasks:
-    - name: ag_resync_db
+    - name: Execute AG rejoin workflow when required
       include_role:
         name: ag_resync_db
-      when: 
+      when:
+        - refresh_context.actions.rejoin_method | default('none') != 'none'
         - rejoin_ag | bool
-        - Dest_ag_name != "N/A"
-    
-# - import_playbook: ag_resync_db.yml
-#   when: 
-#     - rejoin_ag | bool
-#     - Dest_ag_name != "N/A"
-
-# - import_playbook: ag_resync_db.yml
-#   when: (rejoin_ag | bool) and ag_details.agname != "N/A"
-
+        - Dest_ag_name != 'N/A'

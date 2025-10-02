@@ -1,0 +1,9 @@
+SELECT TOP 1
+    bmf.physical_device_name AS physical_device_name,
+    bs.backup_finish_date AS backup_finish_date
+FROM msdb.dbo.backupset AS bs
+JOIN msdb.dbo.backupmediafamily AS bmf
+    ON bs.media_set_id = bmf.media_set_id
+WHERE bs.database_name = %(database_name)s
+  AND bs.type = %(backup_type)s
+ORDER BY bs.backup_finish_date DESC;

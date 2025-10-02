@@ -1,0 +1,24 @@
+WITH replica_data AS (
+    SELECT
+        UPPER(ar.replica_server_name) AS replica_name,
+        ars.role_desc,
+        CASE WHEN ar.failover_mode_desc = 'Manual' THEN 'BCC' ELSE ars.role_desc END AS role_with_bcc,
+        ar.failover_mode_desc,
+        ar.availability_mode_desc,
+        ar.secondary_role_allow_connections_desc,
+        ar.seeding_mode_desc
+    FROM sys.dm_hadr_availability_replica_states AS ars
+    JOIN sys.availability_groups AS ag ON ars.group_id = ag.group_id
+    JOIN sys.availability_replicas AS ar ON ars.replica_id = ar.replica_id
+    WHERE ag.name = %(ag_name)s
+)
+SELECT
+    replica_name,
+    role_desc,
+    role_with_bcc,
+    failover_mode_desc,
+    availability_mode_desc,
+    secondary_role_allow_connections_desc,
+    seeding_mode_desc
+FROM replica_data
+ORDER BY role_desc DESC, replica_name;

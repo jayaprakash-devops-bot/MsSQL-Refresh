@@ -1,424 +1,304 @@
+
 ---
-# Gater_Facts
+- name: Ensure refresh context container exists
+  ansible.builtin.set_fact:
+    refresh_context:
+      source: {}
+      target: {}
+      actions: {}
+  when: refresh_context is not defined
 
-- name: include vars
-  ansible.builtin.include_vars:
-    file: vars.yml
-
-- name: chcek IsHA on destination
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
-    Write-Output $($output.IsHa)
-  args:
-    executable: pwsh
+- name: Record source SQL major version
+  community.general.mssql_script:
+    login_host: "{{ src_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/get_product_version.sql.j2') }}"
+    output: dict
   delegate_to: localhost
-  vars:
-    tsql_query: "select convert(bit,isnull(serverproperty ('IsHADREnabled'), 0)) as IsHa"
-  register: IsHA_dest_result
-  when: refreshonly | bool
+  register: source_version_query
   no_log: true
 
-- set_fact:
-    Is_HA_dest: "{{ IsHA_dest_result.stdout }}"
+- name: Update source version facts
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'source': (refresh_context.source | default({})) | combine({'instance': src_instance, 'database': src_database, 'product_major_version': (source_version_query.query_results_dict | json_query('[0][0][0].major_version') | default(0, true) | int)}, recursive=True)}, recursive=True) }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Source version detected: ' + (source_version_query.query_results_dict | json_query('[0][0][0].major_version') | default(0, true) | string) }}"
 
-- debug:
-    var: Is_HA_dest
-
-- name: chcek IsHA on source
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
-    Write-Output $($output.IsHa)
-  args:
-    executable: pwsh
+- name: Detect HA capability on source instance
+  community.general.mssql_script:
+    login_host: "{{ src_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/check_is_ha.sql.j2') }}"
+    output: dict
   delegate_to: localhost
-  vars:
-    tsql_query: "select convert(bit,isnull(serverproperty ('IsHADREnabled'), 0)) as IsHa"
-  register: IsHA_src_result
-  when: refreshonly | bool
+  register: source_ha_query
   no_log: true
 
-- set_fact:
-    Is_HA_src: "{{ IsHA_src_result.stdout }}"
+- name: Update source HA facts
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'source': (refresh_context.source | default({})) | combine({'is_ha': ((source_ha_query.query_results_dict | json_query('[0][0][0].is_ha') | default(0, true) | int) == 1)}, recursive=True)}, recursive=True) }}"
+    Is_HA_src: "{{ (source_ha_query.query_results_dict | json_query('[0][0][0].is_ha') | default(0, true) | int) == 1 }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Source HA enabled: ' + (((source_ha_query.query_results_dict | json_query('[0][0][0].is_ha') | default(0, true) | int) == 1) | ternary('true','false')) }}"
 
-- debug:
-    var: Is_HA_src
-
-- name: Check if IsDBHA on source
-  shell: |
-        $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
-        Write-Output $($output.Column1)
-  args:
-    executable: pwsh
-  vars: 
-    tsql_query: "declare @IsDBHA bit
-                  select  @IsDBHA = 
-                  case when database_name is not null then 1 else 0 end 
-                  FROM sys.dm_hadr_availability_group_states ags
-                  left outer JOIN master.sys.availability_groups ag ON ags.group_id = ag.group_id
-                  left JOIN sys.availability_databases_cluster agd ON ag.group_id = agd.group_id
-                  WHERE primary_replica = @@Servername
-                  and database_name = '{{ src_database }}'
-                  select isnull(@IsDBHa, 0)"
-  delegate_to: localhost   
-  register: IsDBHA_src_result
-  when: refreshonly | bool
-  no_log: true
-
-- set_fact:
-    Is_DBHA_src: "{{ IsDBHA_src_result.stdout }}"
-
-- debug:  
-    var: Is_DBHA_src
-
-- name: Gather AG details for source (if Is_DBHA_src is True)
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
-    Write-Output $($output.name)
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: |
-      select
-        ag.name 
-      FROM
-        sys.dm_hadr_availability_group_states ags
-      left
-        outer JOIN master.sys.availability_groups ag ON ags.group_id = ag.group_id
-      left
-        JOIN sys.availability_databases_cluster agd ON ag.group_id = agd.group_id
-      WHERE
-        primary_replica = @@Servername
-        and database_name = '{{ src_database }}'
+- name: Gather AG membership for source database
+  community.general.mssql_script:
+    login_host: "{{ src_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/get_database_ag_status.sql.j2') }}"
+    params:
+      database_name: "{{ src_database }}"
+    output: dict
   delegate_to: localhost
-  register: ag_details_src
+  register: source_ag_status
   no_log: true
-  when: Is_DBHA_src | bool
 
-- set_fact:
-    src_ag_name: "{{ ag_details_src.stdout }}"
-  when: 
-    - Is_DBHA_src | bool
+- name: Normalize source AG facts
+  ansible.builtin.set_fact:
+    source_ag_row: "{{ source_ag_status.query_results_dict | json_query('[0][0][0]') | default({}, true) }}"
 
-- debug: 
-    var: src_ag_name
-  when: 
-    - Is_DBHA_src | bool
+- name: Compose source listener target
+  ansible.builtin.set_fact:
+    source_listener_compound: >-
+      {% set name = source_ag_row.listener_name | default('') %}
+      {% set port = source_ag_row.listener_port | default('') %}
+      {% if name %}
+      {{ name }}{% if port %},{{ port }}{% endif %}
+      {% else %}
+      {{ '' }}
+      {% endif %}
 
-- name: Check if IsDBHA on destination
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    Write-Output $($output.Column1)
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: "declare @IsDBHA bit
-                  select  @IsDBHA = 
-                  case when database_name is not null then 1 else 0 end 
-                  FROM sys.dm_hadr_availability_group_states ags
-                  left outer JOIN master.sys.availability_groups ag ON ags.group_id = ag.group_id
-                  left JOIN sys.availability_databases_cluster agd ON ag.group_id = agd.group_id
-                  WHERE primary_replica = @@Servername
-                  and database_name = '{{ dest_database }}'
-                  select isnull(@IsDBHa, 0)"
+- name: Update context for source AG data
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'source': (refresh_context.source | default({})) | combine({
+      'database_in_ag': (source_ag_row.in_ag | default(0) | int) == 1,
+      'ag_name': source_ag_row.ag_name | default('N/A'),
+      'listener': (source_listener_compound | trim),
+      'local_is_primary': (source_ag_row.is_primary_on_local | default(0) | int) == 1
+    }, recursive=True)}, recursive=True) }}"
+    src_ag_name: "{{ source_ag_row.ag_name | default('N/A') | trim }}"
+    Is_DBHA_src: "{{ (source_ag_row.in_ag | default(0) | int) == 1 }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Source database AG membership: ' + (source_ag_row.ag_name | default('N/A')) }}"
+
+- name: Collect replica layout for source AG
+  when: refresh_context.source.database_in_ag | default(false)
+  community.general.mssql_script:
+    login_host: "{{ src_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/list_ag_replicas.sql.j2') }}"
+    params:
+      ag_name: "{{ refresh_context.source.ag_name }}"
+    output: dict
   delegate_to: localhost
-  register: IsDBHA_dest_result
-  when: refreshonly | bool
+  register: source_replicas
   no_log: true
 
-- set_fact:
-    Is_DBHA_dest: "{{ IsDBHA_dest_result.stdout }}"
-- debug:
-    var: Is_DBHA_dest
+- name: Transform replica information for source
+  when: refresh_context.source.database_in_ag | default(false)
+  ansible.builtin.set_fact:
+    source_replica_rows: "{{ source_replicas.query_results_dict | json_query('[0][0]') | default([], true) }}"
+    source_primary_replica: "{{ source_replica_rows | selectattr('role_desc', 'equalto', 'PRIMARY') | map(attribute='replica_name') | list | first | default(src_instance) }}"
+    source_secondary_replicas: "{{ source_replica_rows | selectattr('role_desc', 'equalto', 'SECONDARY') | map(attribute='replica_name') | list }}"
 
-- name: gather ag details for destination
-  shell: |
-        $output = Invoke-sqlcmd -TrustServerCertificate  -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -QueryTimeout 60 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" 
-        Write-Output $output | Select-Object name,agtype,agname,listener | ConvertTo-Json -Compress
-  args:
-    executable: pwsh
-  delegate_to: localhost
-  vars:
-    tsql_query: |
-      SELECT DISTINCT sd.name, (CASE WHEN hdrs.is_primary_replica IS NULL THEN 'NOT REPLICATED' WHEN EXISTS
-                                  (SELECT        *
-                                    FROM            sys.dm_hadr_database_replica_states AS irs
-                                    WHERE        sd.database_id = irs.database_id AND is_primary_replica = 1) 
-        THEN 'PRIMARY' ELSE 'SECONDARY' END) AS agtype, COALESCE (grp.ag_name, 'N/A') AS agname, 
-        CAST(ag_listener.dns_name as Varchar(64)) + ',' + CAST(ag_listener.port as varchar(24)) as listener
-      FROM            sys.availability_group_listeners AS ag_listener RIGHT OUTER JOIN
-                              sys.dm_hadr_name_id_map AS grp ON ag_listener.group_id = grp.ag_id RIGHT OUTER JOIN
-                              sys.databases AS sd LEFT OUTER JOIN 
-                              sys.dm_hadr_database_replica_states AS hdrs ON hdrs.database_id = sd.database_id ON grp.ag_id = hdrs.group_id
-                              where sd.name = '{{ dest_database }}'
-  register: ag_details_dest
-  when: 
-    - refreshonly | bool
-  no_log: true
+- name: Update primary/secondary nodes for source
+  when: refresh_context.source.database_in_ag | default(false)
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'source': (refresh_context.source | default({})) | combine({
+      'replicas': source_replica_rows,
+      'primary_replica': source_primary_replica,
+      'secondary_replicas': source_secondary_replicas
+    }, recursive=True)}, recursive=True) }}"
+    Primary_src_node: "{{ source_primary_replica }}"
+    Secondary_src_node: "{{ source_secondary_replicas }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Source primary replica: ' + source_primary_replica }}"
 
-- name: set log message
-  set_fact:
-    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' AG Details for ' + ag_details_dest.stdout }}"
-  when:
-    - refreshonly | bool
-    - ag_details_dest is defined
-
-- name: set ag details    
-  set_fact:
-    ag_details: "{{ ag_details_dest.stdout }}"
-  when:
-    - refreshonly | bool
-    - ag_details_dest is defined
-  ignore_errors: true
-
-- set_fact:
-    Dest_ag_name: "{{ ag_details.agname }}"
-    listener_name:  "{{ ag_details.listener }}"
-    db_list: "{{ ag_details.name }}"
-  when:
-    - refreshonly | bool
-    - ag_details_dest is defined
-
-- debug:
-    var: Dest_ag_name
-  when:
-    - refreshonly | bool
-    - ag_details_dest is defined
-
-- name: check for contained availability group    
-  win_shell:  |
-    $Output = Invoke-Sqlcmd -Query "{{ ag.contained }}" -QueryTimeout 0 -ServerInstance "{{ dest_instance }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    $Output | Select-Object -ExpandProperty value
-  delegate_to: '{{ ctrl_server }}'
-  register: Dest_Contained_AG
-  no_log: true
-
-- name: set fact for contained AG
-  set_fact:
-    ISContained_Dest: "{{ Dest_Contained_AG.stdout | trim}}"
-    log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' is contained availability group: ' + Dest_Contained_AG.stdout }}"
-  ignore_errors: true
-
-- debug:
-    var: ISContained_Dest
-
-- name: Gather primary node for source (if IsHA_src and IsDBHA_src are True)
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    Write-Output $($output.Replica) 
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: |
-      ; with AGNodes as (
-          select upper(replica_server_name) as Replica, 
-          role_desc as AGRole
-          from sys.dm_hadr_availability_replica_states ars
-          inner join sys.availability_groups ag on ars.group_id = ag.group_id
-          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
-          where ag.name = '{{ src_ag_name }}'
-      )
-      select Replica 
-      from AGNodes
-      where AGRole = 'Primary'
-      order by Replica
-  delegate_to: localhost
-  no_log: true
-  register: primary_secondary_src
-  when: 
-    - Is_HA_src | bool
-    - Is_DBHA_src | bool
-
-- set_fact:
-    Primary_src_node: "{{ primary_secondary_src.stdout }}"
-  when:
-    - Is_HA_src | bool
-    - Is_DBHA_src | bool
-    
-- set_fact:
+- name: Default primary node for source when not in AG
+  when: not refresh_context.source.database_in_ag | default(false)
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'source': (refresh_context.source | default({})) | combine({'primary_replica': src_instance, 'secondary_replicas': []}, recursive=True)}, recursive=True) }}"
     Primary_src_node: "{{ src_instance }}"
-  when:
-    - src_ag_name is not defined
+    Secondary_src_node: []
 
-- name: Gather secondary node for source (if IsHA_src and IsDBHA_src are True)
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    Write-Output $($output.Replica)
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: |
-      ; with AGNodes as (
-          select upper(replica_server_name) as Replica, 
-                case when failover_mode_desc = 'Manual' then 'BCC' else role_desc end as AGRole
-          from sys.dm_hadr_availability_replica_states ars
-          inner join sys.availability_groups ag on ars.group_id = ag.group_id
-          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
-          where ag.name = '{{ src_ag_name }}'
-      )
-      select Replica 
-      from AGNodes
-      where AGRole = 'Secondary'
-      order by Replica
+- name: Record destination SQL major version
+  community.general.mssql_script:
+    login_host: "{{ dest_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/get_product_version.sql.j2') }}"
+    output: dict
   delegate_to: localhost
+  register: dest_version_query
   no_log: true
-  register: secondary_secondary_src
-  when: 
-    - Is_HA_src | bool
-    - Is_DBHA_src | bool
 
-- set_fact:
-    Secondary_src_node: "{{ secondary_secondary_src.stdout }}"
-  when: 
-    - Is_HA_src | bool
-    - Is_DBHA_src | bool
+- name: Update destination version facts
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'target': (refresh_context.target | default({})) | combine({'instance': dest_instance, 'database': dest_database, 'product_major_version': (dest_version_query.query_results_dict | json_query('[0][0][0].major_version') | default(0, true) | int)}, recursive=True)}, recursive=True) }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Destination version detected: ' + (dest_version_query.query_results_dict | json_query('[0][0][0].major_version') | default(0, true) | string) }}"
 
-- debug:
-    var: Primary_src_node
-
-- debug:
-    var: Secondary_src_node
-  when: 
-    - Is_HA_src | bool
-    - Is_DBHA_src | bool
-
-- name: Gather primarynode for destination (if IsHA_dest and IsDBHA_dest are True)
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    Write-Output $($output.Replica)
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: |
-      ; with AGNodes as (
-          select upper(replica_server_name) as Replica, 
-          role_desc as AGRole
-          from sys.dm_hadr_availability_replica_states ars
-          inner join sys.availability_groups ag on ars.group_id = ag.group_id
-          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
-          where ag.name = '{{ Dest_ag_name }}'
-      )
-      select Replica 
-      from AGNodes
-      where AGRole = 'Primary'
-      order by Replica
+- name: Detect HA capability on destination instance
+  community.general.mssql_script:
+    login_host: "{{ dest_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/check_is_ha.sql.j2') }}"
+    output: dict
   delegate_to: localhost
+  register: dest_ha_query
   no_log: true
-  register: primary_secondary_dest
-  when: 
-    - Is_HA_dest | bool
-    - Is_DBHA_dest | bool
 
-- set_fact:
-    Primary_dest_node: "{{ primary_secondary_dest.stdout }}"
-  when: 
-    - Is_HA_dest | bool
-    - Is_DBHA_dest | bool
+- name: Update destination HA facts
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'target': (refresh_context.target | default({})) | combine({'is_ha': ((dest_ha_query.query_results_dict | json_query('[0][0][0].is_ha') | default(0, true) | int) == 1)}, recursive=True)}, recursive=True) }}"
+    Is_HA_dest: "{{ (dest_ha_query.query_results_dict | json_query('[0][0][0].is_ha') | default(0, true) | int) == 1 }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Destination HA enabled: ' + (((dest_ha_query.query_results_dict | json_query('[0][0][0].is_ha') | default(0, true) | int) == 1) | ternary('true','false')) }}"
 
-- name: Gather primarynode for destination (Dest_ag_name == 'N/A')
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    Write-Output $($output.Replica)
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: |
-      ; with AGNodes as (
-          select upper(replica_server_name) as Replica, 
-          role_desc as AGRole
-          from sys.dm_hadr_availability_replica_states ars
-          inner join sys.availability_groups ag on ars.group_id = ag.group_id
-          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
-          where ag.name = '{{ Dest_ag_name }}'
-      )
-      select Replica 
-      from AGNodes
-      where AGRole = 'Primary'
-      order by Replica
+- name: Gather AG membership for destination database
+  community.general.mssql_script:
+    login_host: "{{ dest_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/get_database_ag_status.sql.j2') }}"
+    params:
+      database_name: "{{ dest_database }}"
+    output: dict
   delegate_to: localhost
+  register: dest_ag_status
   no_log: true
-  register: primary_secondary_dest_NoAG
-  when: 
-    - Dest_ag_name == 'N/A'
 
-- set_fact:
-    Primary_dest_node: "{{ primary_secondary_dest_NoAG.stdout }}"
-  when: 
-    - Dest_ag_name == 'N/A'
+- name: Normalize destination AG facts
+  ansible.builtin.set_fact:
+    dest_ag_row: "{{ dest_ag_status.query_results_dict | json_query('[0][0][0]') | default({}, true) }}"
 
-- set_fact:
+- name: Compose destination listener target
+  ansible.builtin.set_fact:
+    dest_listener_compound: >-
+      {% set name = dest_ag_row.listener_name | default('') %}
+      {% set port = dest_ag_row.listener_port | default('') %}
+      {% if name %}
+      {{ name }}{% if port %},{{ port }}{% endif %}
+      {% else %}
+      {{ '' }}
+      {% endif %}
+
+- name: Update context for destination AG data
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'target': (refresh_context.target | default({})) | combine({
+      'database_in_ag': (dest_ag_row.in_ag | default(0) | int) == 1,
+      'ag_name': dest_ag_row.ag_name | default('N/A'),
+      'listener': (dest_listener_compound | trim),
+      'local_is_primary': (dest_ag_row.is_primary_on_local | default(0) | int) == 1
+    }, recursive=True)}, recursive=True) }}"
+    Dest_ag_name: "{{ dest_ag_row.ag_name | default('N/A') | trim }}"
+    listener_name: "{{ dest_listener_compound | trim }}"
+    Is_DBHA_dest: "{{ (dest_ag_row.in_ag | default(0) | int) == 1 }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Destination database AG membership: ' + (dest_ag_row.ag_name | default('N/A')) }}"
+
+- name: Collect replica layout for destination AG
+  when: refresh_context.target.database_in_ag | default(false)
+  community.general.mssql_script:
+    login_host: "{{ dest_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/list_ag_replicas.sql.j2') }}"
+    params:
+      ag_name: "{{ refresh_context.target.ag_name }}"
+    output: dict
+  delegate_to: localhost
+  register: dest_replicas
+  no_log: true
+
+- name: Transform replica information for destination
+  when: refresh_context.target.database_in_ag | default(false)
+  ansible.builtin.set_fact:
+    dest_replica_rows: "{{ dest_replicas.query_results_dict | json_query('[0][0]') | default([], true) }}"
+    dest_primary_replica: "{{ dest_replica_rows | selectattr('role_desc', 'equalto', 'PRIMARY') | map(attribute='replica_name') | list | first | default(dest_instance) }}"
+    dest_secondary_replicas: "{{ dest_replica_rows | selectattr('role_desc', 'equalto', 'SECONDARY') | map(attribute='replica_name') | list }}"
+    dest_auto_seed_supported: "{{ (dest_replica_rows | map(attribute='seeding_mode_desc') | list | unique) == ['AUTOMATIC'] }}"
+
+- name: Update primary/secondary nodes for destination
+  when: refresh_context.target.database_in_ag | default(false)
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'target': (refresh_context.target | default({})) | combine({
+      'replicas': dest_replica_rows,
+      'primary_replica': dest_primary_replica,
+      'secondary_replicas': dest_secondary_replicas,
+      'auto_seed_supported': dest_auto_seed_supported
+    }, recursive=True)}, recursive=True) }}"
+    Primary_dest_node: "{{ dest_primary_replica }}"
+    Secondary_dest_node: "{{ dest_secondary_replicas }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Destination primary replica: ' + dest_primary_replica }}"
+
+- name: Default primary node for destination when not in AG
+  when: not refresh_context.target.database_in_ag | default(false)
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'target': (refresh_context.target | default({})) | combine({'primary_replica': dest_instance, 'secondary_replicas': [], 'auto_seed_supported': false}, recursive=True)}, recursive=True) }}"
     Primary_dest_node: "{{ dest_instance }}"
-  when:
-    - primary_secondary_dest_NoAG is not defined
+    Secondary_dest_node: []
 
-- set_fact:
-    Primary_dest_node: "{{ dest_instance }}"
-  when:
-    - Dest_ag_name == 'N/A'
-
-- name: Gather secondary node for destination (if IsHA_dest and IsDBHA_dest are True)
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    Write-Output $($output.Replica)
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: |
-      ; with AGNodes as (
-          select upper(replica_server_name) as Replica, 
-                case when failover_mode_desc = 'Manual' then 'BCC' else role_desc end as AGRole
-          from sys.dm_hadr_availability_replica_states ars
-          inner join sys.availability_groups ag on ars.group_id = ag.group_id
-          inner join sys.availability_replicas ar on ars.replica_id = ar.replica_id 
-          where ag.name = '{{ Dest_ag_name }}'
-      )
-      select Replica
-      from AGNodes
-      where AGRole = 'Secondary'
-      order by Replica
+- name: Determine contained AG status for destination
+  when: refresh_context.target.database_in_ag | default(false)
+  community.general.mssql_script:
+    login_host: "{{ dest_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/check_contained_ag.sql.j2') }}"
+    params:
+      ag_name: "{{ refresh_context.target.ag_name }}"
+    output: dict
   delegate_to: localhost
-  no_log: true
-  register: secondary_secondary_dest
-  when: 
-    - Is_HA_dest | bool
-    - Is_DBHA_dest | bool
-
-- set_fact:
-    Secondary_dest_node: "{{ secondary_secondary_dest.stdout }}"
-  when: 
-    - Is_HA_dest | bool
-    - Is_DBHA_dest | bool
-
-- debug:
-    var: Primary_dest_node
-
-- debug:
-    var: Secondary_dest_node
-  when:
-    - Is_HA_dest | bool
-    - Is_DBHA_dest | bool
-
-- name: Check connection to destination Server Instance when Non-AG
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ dest_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    Write-Output $output
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: |
-      SELECT @@SERVERNAME AS ServerName;
-  delegate_to: localhost
-  when: Dest_ag_name == 'N/A'
+  register: dest_contained_query
   no_log: true
 
-- name: Check connection to source Server Instance when Non-AG
-  shell: |
-    $output = Invoke-sqlcmd -TrustServerCertificate -ServerInstance "{{ src_instance }}" -Query "{{ tsql_query }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-    Write-Output $output
-  args:
-    executable: pwsh
-  vars:
-    tsql_query: |
-      SELECT @@SERVERNAME AS ServerName;
-  delegate_to: localhost
-  when: Dest_ag_name == 'N/A'
-  no_log: true
+- name: Record contained AG status
+  when: refresh_context.target.database_in_ag | default(false)
+  ansible.builtin.set_fact:
+    ISContained_Dest: "{{ (dest_contained_query.query_results_dict | json_query('[0][0][0].is_contained') | default(0, true) | int) == 1 }}"
+    refresh_context: "{{ refresh_context | combine({'target': (refresh_context.target | default({})) | combine({'is_contained': ISContained_Dest | bool}, recursive=True)}, recursive=True) }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Destination contained AG: ' + (ISContained_Dest | ternary('true','false')) }}"
+
+- name: Default contained flag when AG not in use
+  when: not refresh_context.target.database_in_ag | default(false)
+  ansible.builtin.set_fact:
+    ISContained_Dest: false
+    refresh_context: "{{ refresh_context | combine({'target': (refresh_context.target | default({})) | combine({'is_contained': false}, recursive=True)}, recursive=True) }}"
+
+- name: Compute topology action flags
+  ansible.builtin.set_fact:
+    remove_dest_from_ag_flag: "{{ (refresh_context.target.database_in_ag | default(false)) and (refresh_context.target.is_ha | default(false)) and ((refresh_context.source.database_in_ag | default(false)) or (refresh_context.source.is_ha | default(false))) }}"
+    dest_rejoin_method_flag: >-
+      {% if not (refresh_context.target.database_in_ag | default(false)) %}
+      none
+      {% elif (refresh_context.target.product_major_version | default(0)) <= 13 %}
+      backup
+      {% elif refresh_context.target.auto_seed_supported | default(false) %}
+      autoseed
+      {% else %}
+      backup
+      {% endif %}
+
+- name: Finalize topology action context
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'actions': {
+      'remove_dest_from_ag': remove_dest_from_ag_flag | bool,
+      'target_has_secondaries': (refresh_context.target.secondary_replicas | default([])) | length > 0,
+      'rejoin_method': dest_rejoin_method_flag | trim
+    }}, recursive=True) }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Dest remove-from-AG required: ' + (remove_dest_from_ag_flag | ternary('true','false')) }}"
+
+- name: Expose convenience facts
+  ansible.builtin.set_fact:
+    remove_dest_from_ag: "{{ refresh_context.actions.remove_dest_from_ag | default(false) }}"
+    dest_rejoin_method: "{{ refresh_context.actions.rejoin_method | default('none') }}"
+    target_has_secondaries: "{{ refresh_context.actions.target_has_secondaries | default(false) }}"

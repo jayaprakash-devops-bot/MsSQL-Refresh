@@ -308,17 +308,4 @@ ON rm.member_principal_id = m.principal_id
 where m.name not like 'dbo';
 
 
-/****Loop and output results string****/
-declare @id int
-declare @out varchar(MAX)
-
-SELECT @id = MIN(id) FROM #script
-
-WHILE (@id <= (SELECT MAX(id) FROM #script))
-begin
-	
-    select @out = query from #script where id = @id and query is not null
-	print @out
-    SET @id = @id + 1
-	
-end
+SELECT query FROM #script ORDER BY id;

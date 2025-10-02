@@ -5,7 +5,7 @@
   vars:
     dry_run: true
     log_msg: "{{ '%Y-%m-%d %H:%M:%S' | strftime }} Starting the database restore/migration "  
-    paths_attach: []
+    paths_attach: []  # list of attachment paths
     ag_name: "No AG was defined"
     isContained: false
 
@@ -48,7 +48,7 @@
 
         - name: create attachment string for run log
           set_fact:
-            paths_attach: "{{ paths_attach }} + ['/tmp/{{tower_job_id}}_output.log']"
+            paths_attach: "{{ (paths_attach | default([])) + ['/tmp/' ~ (tower_job_id | string) ~ '_output.log'] }}"
           when: write_log_to_file is defined
 
         - name: get recipients from passed list
@@ -79,9 +79,8 @@
             body: "{{ lookup('template','results_email.j2', errors='warn')}}"
             from: "{{ ctrl_server }}@energytransfer.com"
             to: "{{ recs }}"
-            attach: 
-              - /tmp/{{ tower_job_id }}_output.log
-              - /tmp/{{ tower_job_id }}_all_scripts.zip
+            attach: {{ (paths_attach | default(['/tmp/' ~ (tower_job_id | string) ~ '_output.log'])) | unique }}
+
           delegate_to: localhost
           register: sendmail_out
           ignore_errors: true

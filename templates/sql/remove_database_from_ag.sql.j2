@@ -1,0 +1,12 @@
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = '{{ database_name }}')
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM sys.availability_databases_cluster AS agd
+        JOIN sys.availability_groups AS ag ON ag.group_id = agd.group_id
+        WHERE ag.name = '{{ ag_name }}' AND agd.database_name = '{{ database_name }}'
+    )
+    BEGIN
+        ALTER AVAILABILITY GROUP [{{ ag_name }}] REMOVE DATABASE [{{ database_name }}];
+    END
+END;

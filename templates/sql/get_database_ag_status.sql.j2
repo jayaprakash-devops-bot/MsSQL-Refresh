@@ -1,0 +1,23 @@
+SELECT
+    d.name AS database_name,
+    CASE WHEN agd.group_id IS NULL THEN 0 ELSE 1 END AS in_ag,
+    ISNULL(ag.name, 'N/A') AS ag_name,
+    ISNULL(
+        (SELECT TOP 1 l.dns_name FROM sys.availability_group_listeners AS l WHERE l.group_id = ag.group_id),
+        ''
+    ) AS listener_name,
+    ISNULL(
+        (SELECT TOP 1 CAST(l.port AS varchar(6)) FROM sys.availability_group_listeners AS l WHERE l.group_id = ag.group_id),
+        ''
+    ) AS listener_port,
+    CASE WHEN drs.is_primary_replica = 1 THEN 1 ELSE 0 END AS is_primary_on_local
+FROM sys.databases AS d
+LEFT JOIN sys.availability_databases_cluster AS agd
+    ON d.name = agd.database_name
+LEFT JOIN sys.availability_groups AS ag
+    ON ag.group_id = agd.group_id
+LEFT JOIN sys.dm_hadr_database_replica_states AS drs
+    ON drs.group_id = agd.group_id
+   AND drs.database_id = d.database_id
+   AND drs.is_local = 1
+WHERE d.name = %(database_name)s;

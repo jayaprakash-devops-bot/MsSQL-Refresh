@@ -1,0 +1,6 @@
+IF OBJECT_ID('dbo.sp_RestoreGene') IS NOT NULL
+BEGIN
+    DROP PROCEDURE dbo.sp_RestoreGene;
+END
+GO
+{% include 'sp_create_restore_gene.j2' %}

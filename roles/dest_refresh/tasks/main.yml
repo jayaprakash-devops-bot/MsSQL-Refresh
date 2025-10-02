@@ -1,461 +1,170 @@
+
 ---
-    # var: Primary_dest_node
-    # var: Secondary_dest_node
-    # var: Primary_src_node
-    # var: Secondary_src_node
-#Database Refresh Destination Role
-- name: Error Handling Block for Destination Operations
+- name: Ensure restore script available
+  ansible.builtin.assert:
+    that:
+      - restore_script is defined
+      - restore_script | trim != ''
+    fail_msg: "Restore script is missing. Ensure restore_gen completed successfully."
+
+- name: Define destination connection facts
+  ansible.builtin.set_fact:
+    dest_primary_instance: "{{ refresh_context.target.primary_replica | default(dest_instance) }}"
+    dest_listener_endpoint: "{{ refresh_context.target.listener | default('') }}"
+
+- name: Check destination database existence
+  community.general.mssql_script:
+    login_host: "{{ dest_primary_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/check_database_exists.sql.j2') }}"
+    params:
+      database_name: "{{ dest_database }}"
+    output: dict
+  delegate_to: localhost
+  register: dest_db_exists_query
+  no_log: true
+
+- name: Interpret database existence
+  ansible.builtin.set_fact:
+    dest_db_exists: "{{ (dest_db_exists_query.query_results_dict | json_query('[0][0][0].exists_flag') | default(0, true) | int) == 1 }}"
+
+- name: Abort when migrate requested but destination already present
+  ansible.builtin.fail:
+    msg: "Destination database {{ dest_database }} already exists on {{ dest_primary_instance }} and refreshonly flag is false."
+  when:
+    - dest_db_exists
+    - not (refreshonly | bool)
+
+- name: Capture destination permissions prior to refresh
+  when:
+    - dest_db_exists
+    - refreshonly | bool
   block:
-    - name: create proc sp_Drop_OrphanedUsers and mark as system procedure
-      shell: |  
-        $qry = @'
-        {{ tsql_query }}
-        '@
-        Invoke-sqlcmd  -Query $qry -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"  -TrustServerCertificate -Verbose 4>&1 -OutputSqlErrors $true
-        Invoke-sqlcmd  -Query 'exec sp_MS_marksystemobject  sp_Drop_OrphanedUsers' -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate | Select-Object -ExpandProperty result
-      args:
-        executable: pwsh
+    - name: Query destination permissions script
+      community.general.mssql_script:
+        login_host: "{{ dest_primary_instance }}"
+        login_user: "{{ sql_usr }}"
+        login_password: "{{ sql_pwd }}"
+        name: "{{ dest_database }}"
+        script: "{{ lookup('template', 'roles/dest_refresh/templates/script_perms.sql') }}"
+        output: dict
       delegate_to: localhost
-      vars:
-        tsql_query: "{{ lookup('template','drop_orphaned_database_users.sql.j2')}}"       
-      register: sp_Drop_OrphanedUsers_create
-      ignore_errors: true
-      no_log: true 
-
-    - name: check for existence of {{ dest_database }} on {{ Primary_dest_node }}
-      shell: |
-        $qry = "if db_id('{{ dest_database }}') is not null select 'true' as result else select 'false' as result"
-        Invoke-sqlcmd  -Query $qry -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate | Select-Object -ExpandProperty result
-      args:
-        executable: pwsh
-      delegate_to: localhost  
-      register: dbexists
+      register: dest_permissions_raw
       no_log: true
 
-    - name: add error msg to log and fail to handle migrate and database already exists
-      set_fact:
-        log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' ****Failed - ' + dest_database + '  exists on ' +  Primary_dest_node + 'and cannot be migrated' }}" 
-      when: 
-        - dbexists.stdout == 'true' and not refreshonly | bool
-
-    - name: fail to handle migrate and database already exists
-      fail:
-        msg: "There is all ready a {{ dest_database }} on {{ Primary_dest_node }} and you have chosen migrate."
-      when: 
-        - dbexists.stdout == 'true' and not refreshonly | bool      
-    
-    - set_fact:
-        log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Database Exists? ' + dbexists.stdout }}"
-
-    - name: script logins if {{ dest_database }} exists
-      shell: |
-        Invoke-sqlcmd  -Query "{{ tsql_query }}" -QueryTimeout 0 -ServerInstance "{{ Primary_dest_node }}" -Database '{{ dest_database }}' -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate -Verbose 4>&1 | Out-File -FilePath "/tmp/{{tower_job_id}}_dest_perms.sql"
-      args:
-        executable: pwsh
-      vars:
-        tsql_query: "{{ lookup('template','script_perms.sql')}}"   
+    - name: Persist destination permissions snapshot
+      ansible.builtin.copy:
+        content: "{{ dest_permissions_raw.query_results_dict | json_query('[0][0]') | default([], true) | map(attribute='query') | list | join('
+') }}"
+        dest: "/tmp/{{ tower_job_id }}_dest_perms.sql"
       delegate_to: localhost
-      register: dest_logins_script
-      when: 
-        - dbexists.stdout 
-        - refreshonly | bool
-      no_log: true
 
-    - set_fact:
-        log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Destination permissions output ' + dest_logins_script.stdout }}"
-      when: 
-        - dbexists.stdout 
-        - refreshonly | bool   
-      ignore_errors: true
-    - set_fact:
-        log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Remove ' + ag_details.name + ' from AG  \r\n'}}"
-      when: 
-        - ag_details_dest is defined
-      ignore_errors: true      
+- name: Remove database from AG when required
+  when: refresh_context.actions.remove_dest_from_ag | default(false)
+  community.general.mssql_script:
+    login_host: "{{ dest_primary_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/remove_database_from_ag.sql.j2') }}"
+    vars:
+      ag_name: "{{ refresh_context.target.ag_name }}"
+      database_name: "{{ dest_database }}"
+  delegate_to: localhost
+  no_log: true
 
-    - name: Check if the restore script exists and is not empty
-      stat:
-        path: "/tmp/{{tower_job_id}}_restore.sql"
-      register: restore_script_stat
-      delegate_to: localhost
-      ignore_errors: true
+- name: Execute generated restore script on destination primary
+  community.general.mssql_script:
+    login_host: "{{ dest_primary_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ restore_script }}"
+  delegate_to: localhost
+  register: dest_restore_execution
+  no_log: true
 
-    - name: Failed Refresh Job
-      include_role:
-        name: restore_fail
-      when: not restore_script_stat.stat.exists or restore_script_stat.stat.size == 0
-      
-    - name: remove from ag if needed
-      shell:  |
-        Invoke-Sqlcmd  -Query "BEGIN TRY ALTER AVAILABILITY GROUP [{{ ag_details.agname }}] REMOVE DATABASE [{{ ag_details.name }}]; END TRY BEGIN CATCH END CATCH" `
-        -QueryTimeout 0 -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate     
-      args:
-        executable: pwsh
-      delegate_to: localhost
-      register: remove_from_ag_out        
-      when: 
-        - ag_details_dest is defined 
-        - ag_details.agname != "N/A" 
-        - refreshonly | bool
-      ignore_errors: true
-      no_log: true
+- name: Log restore completion
+  ansible.builtin.set_fact:
+    log_msg: "{{ log_msg ~ '
+' ~ ('%Y-%m-%d %H:%M:%S' | strftime) ~ ' Restore executed on ' ~ dest_primary_instance }}"
 
-    - set_fact:
-        log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Begin Restore of ' + dest_database }}"
+- name: Validate permission script availability
+  ansible.builtin.stat:
+    path: "{{ refresh_context.source.permission_script | default('') }}"
+  delegate_to: localhost
+  register: src_perm_stat
+  when: refresh_context.source.permission_script is defined
 
-    - name: dbug primary instance
-      debug:
-        msg: "{{ Primary_dest_node }}"
-      when: 
-        - ag_details_dest is defined
-      ignore_errors: true 
+- name: Apply source permission script to destination
+  when:
+    - refresh_context.source.permission_script is defined
+    - src_perm_stat.stat.exists
+    - not restore_type is search('No Recovery')
+  community.general.mssql_script:
+    login_host: "{{ dest_primary_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('file', refresh_context.source.permission_script) }}"
+  delegate_to: localhost
+  no_log: true
 
-    - name: Use the restore script
-      debug:
-        msg: |
-          "{{ restore_script }}"
-      when: 
-        - ag_details_dest is defined
-      ignore_errors: true
+- name: Apply source login script on destination primary
+  when:
+    - refresh_context.source.login_script is defined
+    - (refresh_context.source.login_script | length) > 0
+    - not restore_type is search('No Recovery')
+  community.general.mssql_script:
+    login_host: "{{ dest_primary_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('file', refresh_context.source.login_script) }}"
+  delegate_to: localhost
+  no_log: true
+  ignore_errors: true
 
-    # restore script applied here
-    - name: restoring {{src_database}} to {{Primary_dest_node}} as {{dest_database}}
-      shell: |
-            $qry = @'
-            {{ restore_script | trim }}
-            '@
-            $output = Invoke-sqlcmd -Query $qry -QueryTimeout 0 -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate -Verbose 4>&1 -OutputSqlErrors $true
-            Write-Output $output
-      args:
-        executable: pwsh
-      delegate_to: localhost
-      register: restore_out
-      ignore_errors: false
-      no_log: true
-      tags: skip
+- name: Apply login script via listener when available
+  when:
+    - refresh_context.source.login_script is defined
+    - (refresh_context.source.login_script | length) > 0
+    - dest_listener_endpoint | length > 0
+    - not restore_type is search('No Recovery')
+  community.general.mssql_script:
+    login_host: "{{ dest_listener_endpoint }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('file', refresh_context.source.login_script) }}"
+  delegate_to: localhost
+  no_log: true
+  ignore_errors: true
 
-    - name: Debug restore database output
-      debug:
-        msg:
-          - "Restore task stderr: {{ restore_out.stderr | default('No stderr output') }}"
-          - "Restore task stdout: {{ restore_out.stdout | default('No stdout output') }}"
-          - "Restore task return code: {{ restore_out.rc | default('No return code') }}"
-      when: restore_out is defined
-      ignore_errors: true
+- name: Run sp_fix_users to resolve orphaned accounts
+  community.general.mssql_script:
+    login_host: "{{ dest_primary_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "USE [{{ dest_database }}]; EXEC master.dbo.sp_fix_users;"
+  delegate_to: localhost
+  no_log: true
+  ignore_errors: true
+  when:
+    - not restore_type is search('No Recovery')
 
-    - name: Log successful restore duration
-      set_fact:
-        log_msg: "{{ log_msg + '\n\r' + '%Y-%m-%d %H:%M:%S' | strftime + ' Elapsed time to restore is ' + restore_out.delta }}"
-      when: restore_out.rc is defined and restore_out.rc == 0
+- name: Update refresh context for destination state
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'target': (refresh_context.target | default({})) | combine({'restored_at': ('%Y-%m-%d %H:%M:%S' | strftime), 'restore_result': dest_restore_execution.query_results | default([])}, recursive=True)}, recursive=True) }}"
+    log_msg: "{{ log_msg ~ '
+' ~ ('%Y-%m-%d %H:%M:%S' | strftime) ~ ' Destination restore workflow completed.' }}"
 
-    - name: Log restore script output
-      set_fact:
-        log_msg: "{{ log_msg + '\n\r' + '%Y-%m-%d %H:%M:%S' | strftime + ' Restore script output \r' + restore_out.stdout + '\n\r'}}"
-      when: restore_out.rc is defined and restore_out.rc == 0        
+- name: Bundle generated scripts for mail attachment
+  ansible.builtin.shell: |
+    Compress-Archive -Path /tmp/{{ tower_job_id }}*.* -CompressionLevel Optimal -DestinationPath /tmp/{{ tower_job_id }}_all_scripts.zip -Force
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  register: dest_zip_result
+  changed_when: true
 
-    - name: Failed Refresh Job
-      include_role:
-        name: restore_fail
-      when: restore_out.stderr is defined
-
-    - name: applying dbcc updateusage - changing owner to sa
-      shell: |
-        $query = "Use {{dest_database}}; DBCC UPDATEUSAGE([{{dest_database}}]);ALTER AUTHORIZATION ON DATABASE::{{dest_database}} TO sa;"
-        Invoke-sqlcmd  -Query $query -ServerInstance "{{ Primary_dest_node }}" -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate -Verbose 4>&1 | Out-String
-      args:
-        executable: pwsh
-      delegate_to: localhost        
-      register: dbcc_out
-      ignore_errors: true
-      no_log: true
-      when: 
-        - not refreshonly | bool
-        - not restore_type is search("No Recovery")
-      tags: skip  
-
-    - name: removing exsisting users - set owner to sa
-      shell: |
-        Invoke-sqlcmd -Query "{{ tsql_query }}" -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}"
-        Invoke-sqlcmd -Query "ALTER AUTHORIZATION ON DATABASE::{{dest_database}} TO sa" -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
-      args:
-        executable: pwsh
-      delegate_to: localhost  
-      vars:
-        tsql_query: "{{ lookup('template','drop_all_database_users.sql.j2')}}"  
-      register: drop_users_out
-      when:  
-        - not refreshonly | bool
-        - not restore_type is search("No Recovery")
-      tags: skip
-      no_log: true
-
-    - name: verifying/setting destination compatibility mode
-      shell: |
-        Invoke-sqlcmd  -Query "{{ tsql_query }}" -ServerInstance "{{ Primary_dest_node }}" -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
-      args:
-        executable: pwsh
-      delegate_to: localhost        
-      vars:
-        tsql_query: "{{ lookup('template','change_settings_upgrade.sql.j2')}}"           
-      register: compatibility_out
-      when: 
-        - not refreshonly | bool
-        - not restore_type is search("No Recovery")
-      no_log: true
-      tags: skip
-
-    - name: applying source server logins
-      shell: |
-        Invoke-sqlcmd  -InputFile "/tmp/{{tower_job_id}}_src_logins.sql" -ServerInstance "{{ Primary_dest_node }}" -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate -Verbose 4>&1 | Out-String
-      args:
-        executable: pwsh
-      delegate_to: localhost            
-      register: create_usrs_out
-      when:  
-        - not refreshonly | bool
-        - not restore_type is search("No Recovery")
-      ignore_errors: true
-      no_log: true
-      tags: skip
-
-    - set_fact: 
-        log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Create users script output \r' create_usrs_out.stdout}}"            
-      when:  
-        - not refreshonly | bool
-        - not restore_type is search("No Recovery")
-      ignore_errors: true        
-
-    - name: applying source permissions 
-      shell: |
-        Invoke-sqlcmd  -InputFile "/tmp/{{tower_job_id}}_src_perms.sql" -ServerInstance "{{ Primary_dest_node }}" -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate -Verbose 4>&1 | Out-String
-      args:
-        executable: pwsh
-      delegate_to: localhost            
-      register: create_usrs_out
-      when:  
-        - not refreshonly | bool
-        - not restore_type is search("No Recovery")
-      ignore_errors: true
-      no_log: true
-      tags: skip
-
-    - name: applying Destination Users Script to Primary_dest_node {{ Primary_dest_node }}
-      shell: |
-        $out = Invoke-sqlcmd  -InputFile "/tmp/{{tower_job_id}}_dest_perms.sql" -ServerInstance '{{ Primary_dest_node }}' -Database '{{ dest_database }}' -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate -Verbose 4>&1 | Out-String
-        return $out
-      args:
-        executable: pwsh
-      delegate_to: localhost        
-      register: create_usrs_out_dest
-      ignore_errors: true
-      no_log: true
-      when:
-        - refreshonly | bool
-        - dbexists.stdout
-        - Dest_ag_name == 'N/A'
-      tags: skip
-
-    - name: applying Destination Users Script to listener  {{ listener_name }}
-      shell: |
-        ls -ltr "/tmp/{{tower_job_id}}_dest_perms.sql"
-        
-        $out = Invoke-sqlcmd  -InputFile "/tmp/{{tower_job_id}}_dest_perms.sql" -ServerInstance '{{ listener_name }}' -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate -Verbose 4>&1 | Out-String
-        return $out
-      args:
-        executable: pwsh
-      delegate_to: localhost        
-      register: create_usrs_out_dest
-      ignore_errors: true
-      no_log: true
-      when:
-        - refreshonly | bool
-        - dbexists.stdout
-        - Dest_ag_name != 'N/A'
-      tags: skip
-
-    - set_fact: 
-        log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Destination users script output \r' + (create_usrs_out_dest.stdout | default(''))}}"            
-      when:
-        - refreshonly | bool
-        - dbexists.stdout
-        - not restore_type is search("No Recovery")
-        - not isContained
-      tags: skip  
-      ignore_errors: true
-
-    - set_fact: 
-        log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Destination users script output \r' + (create_usrs_out_dest.stdout | default(''))}}"           
-      when:
-        - refreshonly | bool
-        - dbexists.stdout
-        - not restore_type is search("No Recovery")
-        - isContained
-      tags: skip 
-      ignore_errors: true
-
-    - name: Debug destination users output
-      debug:
-        msg: >-
-          Create users task stderr: 
-          {{ create_usrs_out_dest.stderr | default('No stderr output') }}
-          Create users task stdout: 
-          {{ create_usrs_out_dest.stdout | default('No stdout output') }}
-      ignore_errors: true
-
-    - name: Setting Recovery Model to Simple (refreshonly)
-      shell: |
-        $query = "ALTER DATABASE [{{ dest_database }}] SET RECOVERY SIMPLE"
-        Invoke-sqlcmd  -Query $query -ServerInstance "{{ Primary_dest_node }}" -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
-      args:
-        executable: pwsh
-      delegate_to: localhost        
-      when:
-        - refreshonly | bool
-      no_log: true
-      tags: skip
-
-    - set_fact: 
-        log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Set to simple mode' }}"            
-      when: 
-        - refreshonly | bool
-      tags: skip       
-
-    - name: Executing drop_orphaned_users on Listner {{ listener_name }}
-      shell: |
-        Invoke-sqlcmd  -Query "USE {{ dest_database }} EXEC sp_Drop_OrphanedUsers" -ServerInstance "{{ listener_name }}" -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
-      args:
-        executable: pwsh
-      delegate_to: localhost        
-      register: drop_orphanedusers_out
-      no_log: true
-      when: 
-        - sp_Drop_OrphanedUsers_create is succeeded
-        - not restore_type is search("No Recovery")   
-        - Dest_ag_name != 'N/A'
-      ignore_errors: true
-      tags: skip
-
-    - name: Executing drop_orphaned_users on Dest Instance {{ Primary_dest_node }}
-      shell: |
-        Invoke-sqlcmd  -Query "USE {{ dest_database }} EXEC sp_Drop_OrphanedUsers" -ServerInstance "{{ Primary_dest_node }}" -QueryTimeout 0 -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
-      args:
-        executable: pwsh
-      delegate_to: localhost        
-      register: drop_orphanedusers_out
-      no_log: true
-      when: 
-        - sp_Drop_OrphanedUsers_create is succeeded
-        - not restore_type is search("No Recovery")   
-        - Dest_ag_name == 'N/A'
-      ignore_errors: true
-      tags: skip
-
-    - name: Applying fix logins on Listner {{ listener_name }}
-      shell: |
-        Invoke-sqlcmd  -Query "USE {{ dest_database }} exec master.dbo.sp_fix_users" -ServerInstance "{{ listener_name }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
-      args:
-        executable: pwsh
-      delegate_to: localhost        
-      register: fixlogins_out
-      when:  
-        - not refreshonly | bool
-        - not restore_type is search("No Recovery")
-        - Dest_ag_name != 'N/A'
-      no_log: true
-      tags: skip
-
-    - name: Applying fix logins on Dest Instance {{ Primary_dest_node }}
-      shell: |
-        Invoke-sqlcmd  -Query "USE {{ dest_database }} exec master.dbo.sp_fix_users" -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
-      args:
-        executable: pwsh
-      delegate_to: localhost
-      register: fixlogins_out
-      no_log: true
-      when:  
-        - not refreshonly | bool
-        - not restore_type is search("No Recovery")
-        - Dest_ag_name == 'N/A'
-
-    - name: retrieve cred for ansible user
-      cyberark.pas.cyberark_credential:
-        api_base_url: "https://cyberarkccp"
-        app_id: "Ansible_MSSQL"
-        query: "safe=ET_Ansible_MSSQL;UserName=svc_sqlAvia;Address=energy.sug.pri"
-        validate_certs: no
-      register: pwd  
-      delegate_to: localhost
-      run_once: true
-      no_log: true  
-
-    - name: Check & apply Post Script when isContained on Listner {{ listener_name }}
-      win_shell: |
-         $out = Invoke-sqlcmd  -InputFile "\\CETHOU-SQATM01P\Post_Scripts\{{post_script}}" -ServerInstance '{{ listener_name }}' -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -Verbose 4>&1 | Out-String
-         return $out
-      become: yes
-      become_method: runas
-      become_flags: logon_type=new_credentials logon_flags=netcredentials_only
-      vars:
-        ansible_become_user: "svc_sqlAvia@ENERGY.SUG.PRI"
-        ansible_become_password: "{{ pwd.result.Content }}"   
-      delegate_to: "{{ ctrl_server }}"
-      register: post_script_out
-      when: 
-        - post_script != ''
-        - Dest_ag_name != 'N/A'
-      no_log: true
-      ignore_errors: true
-
-    - name: Check & apply Post Script when not isContained on Dest Instance {{ Primary_dest_node }}
-      win_shell: |
-         $out = Invoke-sqlcmd  -InputFile "\\CETHOU-SQATM01P\Post_Scripts\{{post_script}}" -ServerInstance '{{ Primary_dest_node }}' -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -Verbose 4>&1 | Out-String
-         return $out
-      become: yes
-      become_method: runas
-      become_flags: logon_type=new_credentials logon_flags=netcredentials_only
-      vars:
-        ansible_become_user: "svc_sqlAvia@ENERGY.SUG.PRI"
-        ansible_become_password: "{{ pwd.result.Content }}"   
-      delegate_to: "{{ ctrl_server }}"
-      register: post_script_out
-      when: 
-        - post_script != ''
-        - Dest_ag_name == 'N/A'
-      no_log: true
-      ignore_errors: true
-
-    - set_fact: 
-        log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Post script Applied ' + (post_script_out.delta | default(''))}}"            
-      when: 
-        - post_script != ''
-      tags: skip
-      ignore_errors: true
-    - set_fact: 
-        log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Post script Output: \r' + (post_script_out.stdout | default(''))}}"            
-      when: 
-        - post_script != ''
-      tags: skip
-      ignore_errors: true
-        
-        
-  always:
-      - name: zip all of the permissions scripts
-        shell: |
-          Compress-Archive -Path /tmp/{{tower_job_id}}*.* -CompressionLevel Optimal -DestinationPath "/tmp/{{tower_job_id}}_all_scripts.zip" -Force
-        args:
-          executable: pwsh
-        delegate_to: localhost
-        register: zipped_permissions
-
-      - name: create attachment string for dest logins
-        set_fact:
-          paths_attach: "{{ paths_attach }} + ['/tmp/{{tower_job_id}}_all_scripts.zip']"
-        when: 
-          - zipped_permissions is defined
-
-  rescue:
-    - name: add info about any failures to log  
-      set_fact:
-        log_msg: "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' ****Failed Task- ' + ansible_failed_task.name + ' failed with error**** \r' +  ansible_failed_result.stderr }}"
-      when:  
-        - ansible_failed_result.stderr is defined
+- name: Track archive path in refresh context
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'artifacts': {'bundle': '/tmp/' ~ (tower_job_id | string) ~ '_all_scripts.zip'}}, recursive=True) }}"
+    paths_attach: "{{ paths_attach | default([]) + ['/tmp/' ~ (tower_job_id | string) ~ '_all_scripts.zip'] }}"

@@ -1,2 +1,171 @@
-- import_tasks: 01_prechecks.yml
-- import_tasks: 02_modify.yml
+
+---
+- name: Ensure restore context container exists
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'restore': {}}, recursive=True) }}"
+
+- name: Build list of source replicas for backup discovery
+  ansible.builtin.set_fact:
+    source_backup_nodes: "{{ ([refresh_context.source.primary_replica | default(src_instance)] + (refresh_context.source.secondary_replicas | default([]))) | reject('equalto', '') | list | unique }}"
+
+- name: Gather last full backup per replica
+  community.general.mssql_script:
+    login_host: "{{ item }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/get_last_backup.sql.j2') }}"
+    params:
+      database_name: "{{ src_database }}"
+      backup_type: 'D'
+    output: dict
+  delegate_to: localhost
+  loop: "{{ source_backup_nodes }}"
+  register: source_full_backup_raw
+  no_log: true
+  ignore_errors: true
+  loop_control:
+    label: "{{ item }}"
+
+- name: Gather last diff backup per replica
+  community.general.mssql_script:
+    login_host: "{{ item }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'sql/get_last_backup.sql.j2') }}"
+    params:
+      database_name: "{{ src_database }}"
+      backup_type: 'I'
+    output: dict
+  delegate_to: localhost
+  loop: "{{ source_backup_nodes }}"
+  register: source_diff_backup_raw
+  no_log: true
+  ignore_errors: true
+  loop_control:
+    label: "{{ item }}"
+
+- name: Initialize backup candidate containers
+  ansible.builtin.set_fact:
+    full_backup_rows: []
+    diff_backup_rows: []
+
+- name: Collect full backup rows
+  ansible.builtin.set_fact:
+    full_backup_rows: "{{ full_backup_rows + ([{
+      'node': item.item,
+      'physical_device_name': row.physical_device_name,
+      'backup_finish_date': row.backup_finish_date
+    } for row in (item.query_results_dict | json_query('[0][0]') | default([], true))]) }}"
+  loop: "{{ source_full_backup_raw.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item is defined and item.query_results_dict is defined and (item.query_results_dict | json_query('[0][0]') | default([], true)) | length > 0
+
+- name: Collect diff backup rows
+  ansible.builtin.set_fact:
+    diff_backup_rows: "{{ diff_backup_rows + ([{
+      'node': item.item,
+      'physical_device_name': row.physical_device_name,
+      'backup_finish_date': row.backup_finish_date
+    } for row in (item.query_results_dict | json_query('[0][0]') | default([], true))]) }}"
+  loop: "{{ source_diff_backup_raw.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item is defined and item.query_results_dict is defined and (item.query_results_dict | json_query('[0][0]') | default([], true)) | length > 0
+
+- name: Determine latest full backup
+  ansible.builtin.set_fact:
+    restore_full_backup: "{{ (full_backup_rows | sort(attribute='backup_finish_date', reverse=true) | first) | default({}, true) }}"
+
+- name: Determine latest diff backup
+  ansible.builtin.set_fact:
+    restore_diff_backup: "{{ (diff_backup_rows | sort(attribute='backup_finish_date', reverse=true) | first) | default({}, true) }}"
+
+- name: Fail when no full backup located
+  ansible.builtin.fail:
+    msg: "Unable to locate a recent full backup for {{ src_database }} on any replica."
+  when: restore_full_backup == {}
+
+- name: Update restore context with backup metadata
+  ansible.builtin.set_fact:
+    refresh_context: "{{ refresh_context | combine({'restore': (refresh_context.restore | default({})) | combine({
+      'full_backup': restore_full_backup,
+      'diff_backup': restore_diff_backup,
+      'primary_node': refresh_context.source.primary_replica | default(src_instance)
+    }, recursive=True)}, recursive=True) }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Latest full backup: ' + (restore_full_backup.physical_device_name | default('unknown')) }}"
+
+- name: Deploy sp_RestoreGene on primary source replica
+  community.general.mssql_script:
+    login_host: "{{ refresh_context.source.primary_replica | default(src_instance) }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: "{{ lookup('template', 'deploy_restore_gene.sql.j2', errors='strict') }}"
+  delegate_to: localhost
+  no_log: true
+
+- name: Determine restore stored procedure parameters
+  ansible.builtin.set_fact:
+    restore_proc_params: >-
+      {% set rt = restore_type | default('Last Full and Diff') %}
+      {% if rt == 'Last Full and Diff' %}
+      @WithRecovery=1,@FullandDiffOnly=1
+      {% elif rt == 'Last Full and Diff (No Recovery)' %}
+      @WithRecovery=0,@FullandDiffOnly=1
+      {% elif rt == 'Last Full Only' %}
+      @WithRecovery=1,@ExcludeDiffandLogBackups=1
+      {% elif rt == 'Last Full Only (No Recovery)' %}
+      @WithRecovery=0,@ExcludeDiffandLogBackups=1
+      {% elif rt == 'Last Transaction Log' %}
+      @WithRecovery=1
+      {% elif rt == 'Last Transaction Log (No Recovery)' %}
+      @WithRecovery=0
+      {% elif rt == 'Point In Time (Requires Stop at Parameter)' %}
+      {% if stop_at is defined and stop_at | length > 0 %}@WithRecovery=1,@StopAT='{{ stop_at }}'{% else %}@WithRecovery=1{% endif %}
+      {% else %}
+      @WithRecovery=1,@FullandDiffOnly=1
+      {% endif %}
+
+- name: Generate restore script via sp_RestoreGene
+  community.general.mssql_script:
+    login_host: "{{ refresh_context.source.primary_replica | default(src_instance) }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    script: |
+      EXEC dbo.sp_RestoreGene
+          @database='{{ src_database }}',
+          @RestoreScriptOnly=1,
+          @WithReplace=1,
+          {{ restore_proc_params | trim }};
+    output: dict
+  delegate_to: localhost
+  register: restore_script_raw
+  no_log: true
+
+- name: Extract restore script text
+  ansible.builtin.set_fact:
+    restore_script_lines: "{{ restore_script_raw.query_results_dict | json_query('[0][0]') | default([], true) | map(attribute='Value') | list }}"
+    restore_script_text: "{{ restore_script_lines | join('
+') }}"
+
+- name: Fail when restore script generation failed
+  ansible.builtin.fail:
+    msg: "Restore script for {{ src_database }} is empty. Verify backups and sp_RestoreGene output."
+  when: restore_script_text | trim == ''
+
+- name: Persist restore script to control node temp
+  ansible.builtin.copy:
+    content: "{{ restore_script_text }}"
+    dest: "/tmp/{{ tower_job_id }}_restore.sql"
+  delegate_to: localhost
+
+- name: Update context with restore script metadata
+  ansible.builtin.set_fact:
+    restore_script: "{{ restore_script_text }}"
+    refresh_context: "{{ refresh_context | combine({'restore': (refresh_context.restore | default({})) | combine({
+      'script_path': '/tmp/' ~ (tower_job_id | string) ~ '_restore.sql',
+      'parameters': restore_proc_params | trim
+    }, recursive=True)}, recursive=True) }}"
+    log_msg: "{{ log_msg + '
+' + ('%Y-%m-%d %H:%M:%S' | strftime) + ' Restore script generated with parameters: ' + (restore_proc_params | trim) }}"

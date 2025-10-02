@@ -1,0 +1,6 @@
+SELECT CASE
+           WHEN COL_LENGTH('sys.availability_groups', 'is_contained') IS NULL THEN 0
+           ELSE ISNULL((SELECT TOP 1 CAST(is_contained AS int)
+                       FROM sys.availability_groups
+                       WHERE name = %(ag_name)s), 0)
+       END AS is_contained;
