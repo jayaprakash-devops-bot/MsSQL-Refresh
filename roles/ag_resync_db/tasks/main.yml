@@ -29,8 +29,7 @@
 - name: Log auto seed initiation
   when: ag_rejoin_method == 'autoseed'
   ansible.builtin.set_fact:
-    log_msg: "{{ log_msg ~ '
-' ~ ('%Y-%m-%d %H:%M:%S' | strftime) ~ ' Initiated automatic seeding for ' ~ dest_database ~ ' into AG ' ~ ag_name }}"
+    log_msg: "{{ log_msg }}{{ '\n' }}{{ '%Y-%m-%d %H:%M:%S' | strftime }} Initiated automatic seeding for {{ dest_database }} into AG {{ ag_name }}"
 
 - name: Warn when manual seeding required
   when: ag_rejoin_method == 'backup'
