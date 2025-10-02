@@ -40,7 +40,7 @@
     mssql_refresh_restore_plan: "{{ mssql_refresh_restore_plan + [rest_step] }}"
   vars:
     media_paths: "{{ mssql_refresh_source_last_full.device_paths | default('') | split(';') | reject('equalto', '') | list }}"
-    restore_media: "{{ media_paths | map('regex_replace', '^(.*)$', "DISK = N'\\1'") | join(', ') }}"
+    restore_media: '{{ media_paths | map("regex_replace", "^(.*)$", "DISK = N''\\1''") | join(", ") }}'
     rest_step:
       step: 1
       type: FULL
@@ -58,7 +58,7 @@
     label: "diff {{ item.backup_set_id | default('unknown') }}"
   vars:
     diff_media_paths: "{{ item.device_paths | default('') | split(';') | reject('equalto', '') | list }}"
-    diff_restore_media: "{{ diff_media_paths | map('regex_replace', '^(.*)$', "DISK = N'\\1'") | join(', ') }}"
+    diff_restore_media: "{{ diff_media_paths | map('regex_replace', '^(.*)$', 'DISK = N''\\1''') | join(', ') }}"
     rest_step:
       step: "{{ (1 if mssql_refresh_has_full else 0) + diff_idx + 1 }}"
       type: DIFFERENTIAL
@@ -76,7 +76,7 @@
     label: "log {{ item.backup_set_id | default('unknown') }}"
   vars:
     log_media_paths: "{{ item.device_paths | default('') | split(';') | reject('equalto', '') | list }}"
-    log_restore_media: "{{ log_media_paths | map('regex_replace', '^(.*)$', "DISK = N'\\1'") | join(', ') }}"
+    log_restore_media: "{{ log_media_paths | map('regex_replace', '^(.*)$', 'DISK = N''\\1''') | join(', ') }}"
     rest_step:
       step: "{{ (1 if mssql_refresh_has_full else 0) + (mssql_refresh_diff_count | default(0)) + log_idx + 1 }}"
       type: LOG
