@@ -1,0 +1,38 @@
+--This sql will set the destination database compatiblity to match the host instance
+DECLARE @databaseLevel tinyint
+SELECT @databaseLevel = compatibility_level FROM sys.databases WHERE name = '{{ dest_database }}'
+IF @databaseLevel IS NULL
+    BEGIN
+        PRINT N'The database [{{ dest_database }}] does not exist.'
+        RETURN
+    END
+    
+PRINT N'Database Compatibility Level: ' + CONVERT(nvarchar, @databaseLevel) 
+
+DECLARE @productVersion nvarchar(128)
+SELECT @productVersion = CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion'))
+PRINT N'Server Product Version: ' + @productVersion
+
+DECLARE @majorVersion tinyint
+SELECT @majorVersion = CONVERT(tinyint, SUBSTRING(@productVersion, 0, CHARINDEX('.' , @productVersion)))
+PRINT N'Server Major Version: ' + CONVERT(nvarchar, @majorVersion)
+
+DECLARE @serverLevel tinyint
+SET @serverLevel = @majorVersion * 10
+PRINT N'Server Compatibility Level: ' + CONVERT(nvarchar, @serverLevel)
+
+IF @databaseLevel = @serverLevel
+    BEGIN
+        PRINT N'The Compatibility Level for [{{ dest_database }}] already matches the SQL Server version.'
+        RETURN
+    END
+
+DECLARE @query nvarchar(max)
+SET @query = N'ALTER DATABASE [{{ dest_database }}] SET SINGLE_USER'
+EXEC sp_executesql @query
+
+EXEC sp_dbcmptlevel [{{ dest_database }}], @serverLevel
+PRINT N'The Compatibility Level for [{{ dest_database }}] has been updated to ' + CAST(@serverLevel AS VARCHAR(5))
+
+SET @query = N'ALTER DATABASE [{{ dest_database }}] SET MULTI_USER'
+EXEC sp_executesql @query

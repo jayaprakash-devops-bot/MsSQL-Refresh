@@ -1,0 +1,84 @@
+---
+    # var: Primary_dest_node
+    # var: Primary_src_node
+- name: update script if src and dest db names are not equal and write to file
+  shell: | 
+    $script = Get-Content -Path '/tmp/{{tower_job_id}}_restore.sql' -Raw
+    Set-Content -Path "/tmp/{{tower_job_id}}_restore.sql" -Value ($script -ireplace [regex]::Escape('[{{src_database}}]'), '[{{dest_database}}]')
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  register: restore_script_out
+  when: 
+    - src_database != dest_database
+
+# - debug: 
+#     msg: "{{restore_script_out}}"  
+
+- set_fact:
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' \r\n' + restore_script_out.stdout | trim  + ' \r'}}"
+  when: 
+    - src_database != dest_database
+
+- name: ensure number of files mismatch is logged  
+  set_fact: 
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' \r\n' + 'The number of database files between the source and destination is different and this refresh will fail'  + ' \r'}}"  
+  when:  
+    - (dest_database_files | length) != (src_database_files | length) 
+
+- name: fail the refresh when number of database files mis-match
+  fail:
+      msg: "The number of database files between the source and destination is different"
+  when:  
+    - (dest_database_files | length) != (src_database_files | length)
+
+- name: test loop source files and check against dest locations
+  debug: 
+    msg: "File {{item.key}} and will be moved to {{dest_database_files[item.key] | default('undefined')}}" 
+  delegate_to: localhost      
+  loop: "{{ src_database_files | dict2items }}"
+  when: 
+    - dest_database_files[item.key] | default('undefined') | trim != item.value   
+
+#check to see if database file paths are different and generate a move statement and insert into file
+- name: loop source files and check against dest locations 
+  shell: |
+      $script = Get-Content -Path '/tmp/{{tower_job_id}}_restore.sql' -Raw
+      $loc = $script.IndexOf("'REPLACE',") + 51
+      $script = $script.Insert($loc,"`r`n@with = N'MOVE N''{{item.key}}'' TO N''{{dest_database_files[item.key] | default('undefined')}}''',")
+      Set-Content -Path '/tmp/{{tower_job_id}}_restore.sql' -Value $script
+  args:
+    executable: pwsh
+  delegate_to: localhost      
+  loop: "{{ src_database_files | dict2items }}"
+  when: 
+    - dest_database_files[item.key] | default('undefined') | trim != item.value
+  register: datafile_check_1_out
+
+- name: handle new database file move statements
+  shell: |
+    $script = Get-Content -Path '/tmp/{{tower_job_id}}_restore.sql' -Raw
+      $loc = $script.IndexOf("'REPLACE',") + 51
+      $script = $script.Insert($loc,"`r`n@with = N'MOVE N''{{src_database_files.keys()[index]}}'' TO N''{{dest_database_files.values()[index]}}''',")
+      Set-Content -Path '/tmp/{{tower_job_id}}_restore.sql' -Value $script
+  args:
+    executable: pwsh
+  delegate_to: localhost      
+  loop: "{{ src_database_files | dict2items }}"
+  loop_control:
+    index_var: index
+  when: 
+    - datafile_check_1_out is failed
+  register: datafile_check_2_out 
+
+- name: get restore script into var
+  shell: |
+     Get-Content -Path '/tmp/{{tower_job_id}}_restore.sql' -Raw
+  args:
+    executable: pwsh
+  delegate_to: localhost     
+  register: restore_script_out 
+
+- set_fact:
+    restore_script: "{{ kill_script }} {{ restore_script_out.stdout | trim }}"
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Final Restore Script ' + ' \r\n' + restore_script | trim  + ' \r'}}"

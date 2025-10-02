@@ -1,0 +1,4 @@
+dbo.sp_restore_gen @database_source = '{{srcdatabase}}',
+@database_target = '{{destdatabase}}',
+@target_model = 'SIMPLE',@restore_type = 2,
+@backup_software = 'litespeed', @fluff = 1

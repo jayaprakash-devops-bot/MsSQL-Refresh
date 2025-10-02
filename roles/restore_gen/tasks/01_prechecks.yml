@@ -1,0 +1,283 @@
+---
+    # var: Primary_dest_node
+    # var: Primary_src_node
+- name: get default backup location
+  shell: |
+    $output = Invoke-Sqlcmd  -Query "{{ tsql_query }}" -QueryTimeout 0 -ServerInstance "{{ Primary_src_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
+    return $output | Select-Object -ExpandProperty "Value"
+  vars:
+    tsql_query: |    
+      CREATE TABLE #results
+          (Value VARCHAR(24),Data VARCHAR(256)          )
+          INSERT INTO #results
+          EXEC  master.dbo.xp_instance_regread  
+          N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer',N'BackupDirectory'
+          SELECT Data AS Value FROM #results
+  args:
+    executable: pwsh
+  delegate_to: localhost         
+  register: default_backup_loc_output
+  no_log: true
+
+- name: ensure restore generator script exists (sp_restoregene)  
+  shell: |
+    $qry = @'
+            IF EXISTS (SELECT * FROM sys.objects WHERE type = 'P' AND name = 'sp_RestoreGene')
+            BEGIN 
+              DROP PROC [dbo].[sp_RestoreGene]
+            END
+            GO
+            {{ lookup('template','sp_create_restore_gene.j2', errors='warn')}}
+    '@
+    $out = Invoke-Sqlcmd -Query $qry -Database "master" -ServerInstance "{{ Primary_src_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate 
+    return $out
+  args:
+    executable: pwsh
+  no_log: true  
+  delegate_to: localhost
+
+- debug: 
+    msg: "{{ default_backup_loc_output }}"
+    verbosity: 3    
+
+- set_fact: 
+    backup_location: "{{ default_backup_loc_output.stdout |  basename }}"
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Default backup locatoin = ' + default_backup_loc_output.stdout |  basename  + ' \r\n'}}"
+
+- name: get the last full backup file
+  shell: |
+    $output = Invoke-Sqlcmd  -Query "{{ tsql_query }}" -QueryTimeout 0 -ServerInstance "{{ Primary_src_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
+     return $output | Select-Object -ExpandProperty 'File Name' -First 1 #| ConvertTo-Json 
+  vars:
+    tsql_query: |
+      SELECT top 1
+                bmf.physical_device_name as 'File Name'
+            FROM
+                msdb.dbo.backupmediafamily bmf
+                JOIN
+                msdb.dbo.backupset bs ON bs.media_set_id = bmf.media_set_id
+            WHERE
+                bs.database_name = '{{src_database}}' and bs.type = 'D'
+            ORDER BY
+                bmf.media_set_id DESC;
+  args:
+    executable: pwsh
+  delegate_to: localhost                     
+  register: backup_files_output
+  no_log: true         
+
+- set_fact: 
+    backup_file: "{{ backup_files_output.stdout }}"
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Default backup locatoin = ' + backup_files_output.stdout |  basename  + ' \r\n'}}" 
+
+- debug: 
+    msg: "xp_restore_filelistonly @filename='{{ backup_file | trim}}'"
+    verbosity: 3    
+
+- name: get source datafile locations
+  shell: |
+    $ErrorActionPreference = 'Stop'
+    try{
+    $output = Invoke-Sqlcmd -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -Query "{{ tsql_query }}" -ServerInstance "{{ Primary_src_node }}" -Database "{{ src_database }}" -TrustServerCertificate
+      }
+    catch{
+      return $_.Exception.Message 
+      }
+    if (!$Error){
+         return $output | Select-Object PhysicalName,LogicalName,FileType | ConvertTo-Json -Compress
+      }
+  vars:  
+    tsql_query: |
+      select name as LogicalName,Physical_Name as PhysicalName,type as FileType from sys.database_files
+  args:
+    executable: pwsh
+  delegate_to: localhost                         
+  register: source_files_output
+  ignore_errors: true
+  failed_when: "'PhysicalName' not in source_files_output.stdout"
+  no_log: true
+  
+- debug:
+    msg: "{{ source_files_output.stdout }}" 
+    verbosity: 3 
+  
+- name: append error message
+  set_fact:
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' ' + item | trim }}" 
+  loop:
+    - 'There was a error retrieving the data file layout using xp_restore_filelistonly'
+    - "{{ source_files_output.stdout }}"
+  ignore_errors: true
+  when: 
+    - source_files_output is failed
+
+- name: create source database files dictionary
+  set_fact:
+    src_database_files:  "{{ src_database_files  | combine({ item.LogicalName: item.PhysicalName })}}" 
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Source Database File ' + item.PhysicalName  + ' \r'}}" 
+  loop:  "{{ source_files_output.stdout }}"
+
+- name: handle missing destination database
+  block:
+    - name: get destination datafile locations           
+      shell: |
+        $output = Invoke-Sqlcmd -Query "{{ tsql_query }}" -QueryTimeout 0 -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
+        # return $output | Select-Object PhysicalName,LogicalName | ConvertTo-Json -Compress
+        return $output | Select-Object PhysicalName,LogicalName, FileType | ConvertTo-Json -Compress
+      vars:  
+        # tsql_query: |
+        #   USE [{{dest_database}}] select [name] as LogicalName,filename as PhysicalName from sys.sysfiles
+        tsql_query: |
+          select mf.name as LogicalName, physical_name as PhysicalName, type as FileType
+          from sys.databases d inner join sys.master_files mf on d.database_id = mf.database_id
+          where d.name = '{{dest_database}}'
+      args:
+        executable: pwsh
+      delegate_to: localhost              
+      register: destination_files_output
+      failed_when: destination_files_output.stderr != ""            
+      no_log: true
+
+    - name: create destination database files dictionary
+      set_fact:
+        dest_database_files:  "{{ dest_database_files  | combine({ item.LogicalName: item.PhysicalName })}}"
+        log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Destination Database File ' + item.PhysicalName  + ' \r'}}"   
+      loop:  "{{ destination_files_output.stdout }}"
+      
+  rescue:
+    - name: get default data and log file locations
+      shell: | 
+        $output = Invoke-Sqlcmd -Query "{{ tsql_query }}" -QueryTimeout 0 -ServerInstance "{{ Primary_dest_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
+            return $output | Select-Object DataPath,LogPath | ConvertTo-Json -Compress
+      vars:
+        tsql_query: select SERVERPROPERTY('InstanceDefaultDataPath') AS DataPath, SERVERPROPERTY('InstanceDefaultLogPath') AS LogPath
+      args:
+        executable: pwsh
+      delegate_to: localhost      
+      register: dest_data_path_out      
+      no_log: true
+
+    - set_fact:
+        default_paths: "{{ dest_data_path_out.stdout  }}"
+        log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Destination Data Paths ' + dest_data_path_out.stdout  + ' \r'}}"
+
+    - name: create destination database files dictionary using default locations
+      set_fact:
+        dest_database_files:  "{{ dest_database_files | combine({ item.LogicalName: path | replace('.',stamp)  })}}"
+        log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Destination Database File ' + item.PhysicalName  + ' \r'}}" 
+      vars:
+        stamp: "{{ '_' + '%Y%m%d%H%M%S' | strftime + '.'}}"
+        path: "{{ (default_paths.DataPath if (item.FileType == 0) else default_paths.LogPath) | win_dirname }}\\{{ item.PhysicalName | win_basename }}"
+      loop: "{{ source_files_output.stdout }}"
+
+- name: Convert stop_at (UTC) → CST
+  shell: >
+    TZ='America/Chicago' date -d '{{ stop_at }} UTC' +'%Y-%m-%d %H:%M:%S'
+  register: cst_time
+  delegate_to: localhost
+  run_once: true
+  ignore_errors: true
+
+- name: Save the CST timestamp
+  set_fact:
+    stop_at_cst: "{{ cst_time.stdout }}"
+  when: cst_time.stdout is defined
+  delegate_to: localhost
+  run_once: true
+  ignore_errors: true
+
+- name: debug stop at cst_time
+  debug:
+    msg: "{{ cst_time.stdout }}"
+    verbosity: 3
+  ignore_errors: true
+
+- name: Determine restore parameters for {{ src_database }}
+  set_fact:
+    restore_params: >-
+      {% set rt = restore_type %}
+      {% if rt == "Last Full and Diff" %}
+        @WithRecovery=1,@FullandDiffOnly=1
+      {% elif rt == "Last Full and Diff (No Recovery)" %}
+        @WithRecovery=0,@FullandDiffOnly=1
+      {% elif rt == "Last Full Only" %}
+        @WithRecovery=1,@ExcludeDiffandLogBackups=1
+      {% elif rt == "Last Full Only (No Recovery)" %}
+        @WithRecovery=0,@ExcludeDiffandLogBackups=1
+      {% elif rt == "Last Transaction Log" %}
+        @WithRecovery=1
+      {% elif rt == "Last Transaction Log (No Recovery)" %}
+        @WithRecovery=0
+      {% elif rt == "Point In Time (Requires Stop at Parameter)" and stop_at_cst is defined %}
+        @WithRecovery=1,@StopAT='{{ stop_at_cst }}'
+      {% else %}
+        @WithRecovery=1,@FullandDiffOnly=1
+      {% endif %}
+  delegate_to: localhost
+
+- name: debug restore_params 
+  debug:
+    msg: "{{ restore_params }}"
+    verbosity: 3
+  when: restore_params is defined and restore_params != ""
+  delegate_to: localhost
+
+# - name: "generate restore script for {{ src_database }}"
+#   shell:  |
+#         $qry2 = switch ("{{restore_type}}")
+#         {
+#           "Last Full and Diff" {"@WithRecovery=1,@FullandDiffOnly=1"}
+#           "Last Full and Diff (No Recovery)" {"@WithRecovery=0,@FullandDiffOnly=1"}
+#           "Last Full Only" {"@WithRecovery=1,@ExcludeDiffandLogBackups = 1"}
+#           "Last Full Only (No Recovery)" {"@WithRecovery=0,@ExcludeDiffandLogBackups = 1"}
+#           "Last Transaction Log" {"@WithRecovery=1"}
+#           "Last Transaction Log (No Recovery)" {"@WithRecovery=0"}
+#           "Point In Time (Requires Stop at Parameter)" {"@WithRecovery=1,@StopAT='{{stop_at}}'"}
+#           Default {"@WithRecovery=1,@FullandDiffOnly=1"}
+#         }        
+#         $qry = "exec sp_restoregene @database='{{ src_database }}',@RestoreScriptOnly=1,@WithReplace=1,{0}" -f $qry2
+#         $output = Invoke-Sqlcmd  -Query $qry -QueryTimeout 0 -ServerInstance "{{ Primary_src_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
+#         $output | Select-Object -ExpandProperty "Value"
+#   args:
+#     executable: pwsh
+#   delegate_to: localhost
+#   register: restore_gen_output
+#   no_log: true
+
+- name: "generate restore script for {{ src_database }}"
+  shell: |
+    $qry = "exec sp_restoregene @database='{{ src_database }}',@RestoreScriptOnly=1,@WithReplace=1,{{ restore_params }}"
+    $output = Invoke-Sqlcmd  -Query $qry -QueryTimeout 0 -ServerInstance "{{ Primary_src_node }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate
+    $output | Select-Object -ExpandProperty "Value"
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  register: restore_gen_output
+  no_log: true
+
+- name: write restore script to tmp folder 
+  copy: 
+    content: "{{ restore_gen_output.stdout }}" 
+    dest: "/tmp/{{tower_job_id}}_restore.sql"
+  delegate_to: localhost 
+
+- set_fact: 
+    restore_script: "{{ restore_gen_output.stdout }}"
+    log_msg:  "{{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' Initial Restore Script \n' + restore_gen_output.stdout  + ' \r'}}" 
+
+- name: debug restore script 
+  shell: |
+    get-content -path "/tmp/{{tower_job_id}}_restore.sql" -raw | Out-String
+  register: debug_restore_script_test
+  delegate_to: localhost
+  args:
+    executable: pwsh
+  ignore_errors: true
+  
+- name: "handle error conditions"
+  fail:
+        msg: "There was a issue creating the restore script, please verify backups/database exists"
+  when: 
+    - restore_gen_output.stdout == ""
+    - backup_location == ""
+    - restore_gen_output is failed

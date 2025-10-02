@@ -1,4 +1,5 @@
 ---
+<<<<<<< HEAD
 - name: Start database refresh orchestration
   block:
     - name: Acquire SQL credentials from CyberArk (optional)
@@ -27,3 +28,10 @@
       ansible.builtin.debug:
         msg: "Refresh orchestration failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
       failed_when: true
+=======
+- name: start database refresh
+  block:
+    - name: CyberArk credentials
+      include_role:
+        name: CyberArk
+>>>>>>> dfd21d0 (init)

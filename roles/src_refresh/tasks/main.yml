@@ -1,0 +1,230 @@
+---
+    # var: Primary_dest_node
+    # var: Secondary_dest_node
+    # var: Primary_src_node
+    # var: Secondary_src_node
+#Database Refresh Source Role
+#scripts the restore and logins of the source database
+- name: Execute check last full backup info on both servers
+  shell: |
+    Invoke-sqlcmd -Query "{{ tsql_query }}" -ServerInstance "{{ item }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate | Select-Object age_hours,physical_device_name | ConvertTo-Json
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  loop: "{{ [Primary_src_node] + ([Secondary_src_node] if Secondary_src_node is defined else []) }}"
+  vars:
+    tsql_query: "{{ lookup('template','sp_check_lastbackup_loc_date.sql.j2') }}"
+  register: full_backup_info
+  no_log: true
+  ignore_errors: true
+
+# - name: Execute check last full backup info on both servers
+#   shell: |
+#     Invoke-sqlcmd -Query "{{ tsql_query }}" -ServerInstance "{{ item }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate | 
+#     Select-Object age_hours, physical_device_name | ConvertTo-Json
+#   args:
+#     executable: pwsh
+#   delegate_to: localhost
+#   loop: "{{ [Primary_src_node] + ([Secondary_src_node] | default([]) | select('search', '^.+$') | list) }}"
+#   vars:
+#     tsql_query: "{{ lookup('template','sp_check_lastbackup_loc_date.sql.j2') }}"
+#   register: full_backup_info
+#   no_log: true
+
+# Step 2: Execute check last diff backup info on both servers
+- name: Execute check last diff backup info on both servers
+  shell: |
+    Invoke-sqlcmd -Query "{{ tsql_query }}" -ServerInstance "{{ item }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate | Select-Object age_hours,physical_device_name | ConvertTo-Json
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  loop: "{{ [Primary_src_node] + ([Secondary_src_node] if Secondary_src_node is defined else []) }}"
+  vars:
+    tsql_query: "{{ lookup('template','sp_check_lastdiff_loc_date.sql.j2') }}"
+  register: diff_backup_info
+  no_log: true
+  ignore_errors: true
+
+# - name: Execute check last diff backup info on both servers
+#   shell: |
+#     Invoke-sqlcmd -Query "{{ tsql_query }}" -ServerInstance "{{ item }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate | Select-Object age_hours,physical_device_name | ConvertTo-Json
+#   args:
+#     executable: pwsh
+#   delegate_to: localhost
+#   loop: "{{ [Primary_src_node] + ([Secondary_src_node] | default([]) | select('search', '^.+$') | list) }}"
+#   vars:
+#     tsql_query: "{{ lookup('template','sp_check_lastdiff_loc_date.sql.j2') }}"
+#   register: diff_backup_info
+#   no_log: true
+
+# Filter and clean up full backup info
+- name: Filter full backup info and remove empty outputs
+  set_fact:
+    full_backup_cleaned: >-
+      {{
+        full_backup_info.results |
+        selectattr('stdout', 'defined') |
+        map(attribute='stdout') |
+        reject('equalto', '') |
+        map('from_json') |
+        list
+      }}
+
+# Filter and clean up diff backup info
+- name: Filter diff backup info and remove empty outputs
+  set_fact:
+    diff_backup_cleaned: >-
+      {{
+        diff_backup_info.results |
+        selectattr('stdout', 'defined') |
+        map(attribute='stdout') |
+        reject('equalto', '') |
+        map('from_json') |
+        list
+      }}
+
+# Debug cleaned full backup info
+- name: Debug cleaned full backup info
+  debug:
+    msg: "{{ full_backup_cleaned }}"
+  when: 
+    - full_backup_cleaned | length > 0
+
+# Debug cleaned diff backup info
+- name: Debug cleaned diff backup info
+  debug:
+    msg: "{{ diff_backup_cleaned }}"
+  when: 
+    - diff_backup_cleaned | length > 0
+
+# Set facts for full backup if only one valid server's data exists
+- name: Set fact for full backup when only one server has data
+  set_fact:
+    age_hours_full: "{{ full_backup_cleaned[0].age_hours }}"
+    physical_device_name_full: "{{ full_backup_cleaned[0].physical_device_name }}"
+  when: full_backup_cleaned | length == 1
+
+
+# Compare full backup info and set facts if data is available for both servers
+- name: Compare full backup info and determine the latest full backup
+  set_fact:
+    age_hours_full: "{{ (full_backup_cleaned | sort(attribute='age_hours') | first).age_hours }}"
+    physical_device_name_full: "{{ (full_backup_cleaned | sort(attribute='age_hours') | first).physical_device_name }}"
+  when: full_backup_cleaned | length > 1
+
+# Debug latest full backup
+- name: Debug latest full backup
+  debug:
+    msg:
+      - "Age of the latest full backup (hours): {{ age_hours_full }}"
+      - "Path of the latest full backup: {{ physical_device_name_full }}"
+  when: age_hours_full is defined
+
+# Set facts for diff backup if only one valid server's data exists
+- name: Set fact for diff backup when only one server has data
+  set_fact:
+    age_hours_diff: "{{ diff_backup_cleaned[0].age_hours }}"
+    physical_device_name_diff: "{{ diff_backup_cleaned[0].physical_device_name }}"
+  when: diff_backup_cleaned | length == 1
+
+# Compare diff backup info and determine the latest backup if data exists for multiple servers
+- name: Compare diff backup info and determine the latest diff backup
+  set_fact:
+    age_hours_diff: "{{ (diff_backup_cleaned | sort(attribute='age_hours') | first).age_hours }}"
+    physical_device_name_diff: "{{ (diff_backup_cleaned | sort(attribute='age_hours') | first).physical_device_name }}"
+  when: diff_backup_cleaned | length > 1
+
+# Debug latest diff backup
+- name: Debug latest diff backup
+  debug:
+    msg:
+      - "Age of the latest diff backup (hours): {{ age_hours_diff }}"
+      - "Path of the latest diff backup: {{ physical_device_name_diff }}"
+  when: age_hours_diff is defined
+
+# Skip comparison if only one server has backup data and proceed with the available backup
+- name: Skip comparison and proceed with available full and diff backups
+  debug:
+    msg:
+      - "Proceeding with available full backup: {{ physical_device_name_full }}"
+      - "Proceeding with available diff backup: {{ physical_device_name_diff }}"
+      - "Full backup age: {{ age_hours_full }}"
+      - "Diff backup age: {{ age_hours_diff }}"
+  when: full_backup_info.results | selectattr('stdout', 'defined') | list | length == 1 or
+        diff_backup_info.results | selectattr('stdout', 'defined') | list | length == 1
+
+# Validate differential backup compared to the full backup
+# - name: Validate differential backup age compared to the last full backup
+#   set_fact:
+#     valid_diff_backup: >-
+#       {{
+#         (age_hours_diff is defined and age_hours_full is defined) and
+#         (age_hours_diff < age_hours_full)
+#       }}
+#   when: age_hours_diff is defined and age_hours_full is defined
+
+- name: Validate differential backup age compared to the last full backup
+  set_fact:
+    valid_diff_backup: "{{ age_hours_diff | int < age_hours_full | int }}"
+  when: age_hours_diff is defined and age_hours_full is defined
+  ignore_errors: true
+  
+- name: Debug age variables
+  debug:
+    msg:
+      - "age_hours_diff: {{ age_hours_diff }} (type: {{ age_hours_diff | type_debug }})"
+      - "age_hours_full: {{ age_hours_full }} (type: {{ age_hours_full | type_debug }})"
+  ignore_errors: true
+  when: age_hours_diff is defined and age_hours_full is defined
+
+# Handle no valid differential backup found
+- name: Proceed only with the last full backup if no valid differential backup
+  set_fact:
+    latest_diff_backup_file: "No differential backup found after the last full backup"
+  when: not valid_diff_backup | bool
+
+- name: Debug differential backup status
+  debug:
+    msg:
+      - "Valid differential backup found: {{ valid_diff_backup }}"
+      - "Differential backup path: {{ physical_device_name_diff if valid_diff_backup else 'No valid differential backup found' }}"
+  when: age_hours_diff is defined
+
+# Handle no differential backup found
+- name: Handle no differential backup found
+  set_fact:
+    latest_diff_backup_file: "No differential backup found"
+    log_msg: >-
+      {{ log_msg + '\n' + '%Y-%m-%d %H:%M:%S' | strftime + ' No Differential Backup Found' }}
+  when: diff_backup_info.results | length == 0
+
+- name: Script users for {{ src_database }} on {{ Primary_src_node }}
+  shell: |
+    [string]$qry=@'
+        {{ lookup('template','script_perms.sql') }}
+    '@
+    Invoke-sqlcmd -QueryTimeout 0 -Query $qry -ServerInstance "{{ Primary_src_node }}" `
+    -Database "{{ src_database }}" -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate `
+    -Verbose 4>&1 | Out-File -FilePath "/tmp/{{ tower_job_id }}_src_perms.sql"
+    (Get-Content -Path "/tmp/{{ tower_job_id }}_src_perms.sql").Replace('use [{{ src_database }}]', 'use [{{ dest_database }}]') | Set-Content "/tmp/{{ tower_job_id }}_src_perms.sql"
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  register: src_perms_script
+  no_log: true
+  when: refreshonly | bool == False
+
+- name: Script logins for {{ src_database }} on {{ Primary_src_node }}
+  shell: |
+    $qout = "/tmp/{{ tower_job_id }}_src_logins.sql"
+    Invoke-sqlcmd -Query "sp_script_login @script_scope='Server', @database_name = '{{ src_database }}'" `
+    -QueryTimeout 0 -ServerInstance "{{ Primary_src_node }}" `
+    -UserName "{{ sql_usr }}" -Password "{{ sql_pwd }}" -TrustServerCertificate `
+    -Verbose 4>&1 | Select-Object -ExpandProperty sqltext | Out-File -FilePath "$qout"
+    (Get-Content -Path $qout) -replace "DEFAULT_DATABASE = \[(?!master)[^;]*", "DEFAULT_DATABASE = [master]" | Set-Content $qout
+  args:
+    executable: pwsh
+  delegate_to: localhost
+  register: src_logins_script
+  no_log: true
+  when: refreshonly | bool == False

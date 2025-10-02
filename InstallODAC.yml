@@ -1,0 +1,21 @@
+---
+#Install ODAC client on target hosts
+- name: Gather Facts
+  hosts: all
+  gather_facts: false
+
+  tasks:
+  - name: Include gInstances
+    include_role:
+      name: dbfacts
+      tasks_from: gInstances
+    vars:
+       online_only: true
+
+  # - name: Verify PS config
+  #   include_role:
+  #      name: psconfig
+
+  - name: Install ODAC client
+    include_role:
+       name: odac

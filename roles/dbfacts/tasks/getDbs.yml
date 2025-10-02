@@ -1,0 +1,26 @@
+#Populates facts related to databases on a instance
+#- name: Get the Databases for a host SQL instance
+#  debug: msg="{{hostvars[inventory_hostname]['instances']}}"
+
+- name: loop through instances and list databases
+  win_shell: |
+        $ErrorActionPreference = "Stop";
+        try{Import-Module SQLPS}
+        catch{
+          Add-PSSnapin SqlServerCmdletSnapin100
+          Add-PSSnapin SqlServerProviderSnapin100
+          }
+          $server = "{{ item }}"
+          Invoke-Sqlcmd -ServerInstance $server -Query 'SELECT [name] FROM sys.databases WHERE database_id > 4' | Select-Object -ExpandProperty name
+  register:  dblist
+  with_items: "{{hostvars[inventory_hostname]['instances']}}"
+  no_log: true
+
+- set_fact:
+
+
+
+
+
+
+
