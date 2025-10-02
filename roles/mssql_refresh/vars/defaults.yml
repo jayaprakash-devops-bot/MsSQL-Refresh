@@ -1,0 +1,19 @@
+---
+# Role defaults - override from inventory or extra_vars when needed
+mssql_refresh_source_instance: "{{ src_instance | default(omit) }}"
+mssql_refresh_source_listener: "{{ src_listener | default(mssql_refresh_source_instance) }}"
+mssql_refresh_source_database: "{{ src_database }}"
+mssql_refresh_target_instance: "{{ dest_instance }}"
+mssql_refresh_target_listener: "{{ dest_listener | default(mssql_refresh_target_instance) }}"
+mssql_refresh_target_database: "{{ dest_database }}"
+mssql_refresh_work_database: "tempdb"
+mssql_refresh_output_format: default
+mssql_refresh_use_transaction: false
+mssql_refresh_backup_types: ['D','I']
+mssql_refresh_backup_lookback_hours: 72
+mssql_refresh_security_excluded_logins:
+  - '##MS_PolicyTsqlExecutionLogin##'
+  - 'NT AUTHORITY\\SYSTEM'
+  - 'NT SERVICE\\SQLWriter'
+  - 'NT SERVICE\\Winmgmt'
+  - 'sa'

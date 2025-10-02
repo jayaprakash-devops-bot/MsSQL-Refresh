@@ -1,0 +1,13 @@
+---
+- name: Load default role variables
+  ansible.builtin.include_vars:
+    file: "{{ role_path }}/vars/defaults.yml"
+
+- name: Run pre-refresh topology checks
+  ansible.builtin.include_tasks: precheck.yml
+
+- name: Discover refresh backup chain
+  ansible.builtin.include_tasks: backups.yml
+
+- name: Capture destination security metadata
+  ansible.builtin.include_tasks: security.yml

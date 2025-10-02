@@ -1,6 +1,29 @@
 ---
-- name: start database refresh
+- name: Start database refresh orchestration
   block:
-    - name: CyberArk credentials
-      include_role:
+    - name: Acquire SQL credentials from CyberArk (optional)
+      ansible.builtin.include_role:
         name: CyberArk
+      when: mssql_refresh_use_cyberark | bool
+
+    - name: Ensure SQL authentication variables are present
+      ansible.builtin.assert:
+        that:
+          - sql_usr is defined
+          - sql_pwd is defined
+        fail_msg: "SQL credentials are required to continue the refresh workflow"
+      when: mssql_refresh_require_credentials | bool
+
+    - name: Run MSSQL refresh preparation workflow
+      ansible.builtin.include_role:
+        name: mssql_refresh
+
+    - name: Present restore plan for validation
+      ansible.builtin.debug:
+        var: mssql_refresh_restore_plan
+      when: mssql_refresh_restore_plan is defined
+  rescue:
+    - name: Surface refresh orchestration failure
+      ansible.builtin.debug:
+        msg: "Refresh orchestration failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+      failed_when: true

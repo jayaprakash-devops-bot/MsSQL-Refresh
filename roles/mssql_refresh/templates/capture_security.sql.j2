@@ -1,0 +1,80 @@
+SET NOCOUNT ON;
+DECLARE @excluded TABLE (name sysname);
+INSERT INTO @excluded(name)
+VALUES
+  ('##MS_PolicyEventProcessingLogin##'),
+  ('##MS_PolicyTsqlExecutionLogin##'),
+  ('sa');
+
+-- Server login definitions (excluding built-ins / service accounts)
+SELECT
+    sp.name AS login_name,
+    sp.type_desc,
+    sp.default_database_name,
+    sp.default_language_name,
+    CONVERT(varchar(max), sp.sid, 2) AS sid_hex,
+    sl.is_policy_checked,
+    sl.is_expiration_checked,
+    CASE WHEN sp.type = 'S' AND sl.password_hash IS NOT NULL THEN CONVERT(varchar(max), sl.password_hash, 2) ELSE NULL END AS password_hash,
+    CASE
+      WHEN sp.type = 'S' AND sl.password_hash IS NOT NULL THEN 'CREATE LOGIN [' + sp.name + '] WITH PASSWORD = 0x' + CONVERT(varchar(max), sl.password_hash, 2) + ' HASHED, SID = 0x' + CONVERT(varchar(max), sp.sid, 2) + ', CHECK_POLICY = ' + CASE WHEN sl.is_policy_checked = 1 THEN 'ON' ELSE 'OFF' END + ', CHECK_EXPIRATION = ' + CASE WHEN sl.is_expiration_checked = 1 THEN 'ON' ELSE 'OFF' END + ';'
+      WHEN sp.type IN ('G','U') THEN 'CREATE LOGIN [' + sp.name + '] FROM WINDOWS WITH DEFAULT_DATABASE = [' + ISNULL(sp.default_database_name, 'master') + '];'
+      WHEN sp.type = 'E' THEN 'CREATE LOGIN [' + sp.name + '] WITH PASSWORD = ''<contained_login_password_placeholder>'';'
+      ELSE NULL
+    END AS create_statement
+FROM sys.server_principals sp
+LEFT JOIN sys.sql_logins sl ON sp.principal_id = sl.principal_id
+WHERE sp.type IN ('S','U','G','E')
+  AND sp.name NOT IN (SELECT name FROM @excluded)
+  AND sp.name NOT LIKE 'NT SERVICE%'
+  AND sp.name NOT LIKE 'NT AUTHORITY%'
+  AND sp.name NOT LIKE '##%'
+ORDER BY sp.name;
+
+-- Server role memberships to reapply
+SELECT
+    role.name AS server_role,
+    member.name AS member_name,
+    'ALTER SERVER ROLE [' + role.name + '] ADD MEMBER [' + member.name + '];' AS add_member_statement
+FROM sys.server_role_members srm
+JOIN sys.server_principals role ON role.principal_id = srm.role_principal_id
+JOIN sys.server_principals member ON member.principal_id = srm.member_principal_id
+WHERE member.name NOT IN (SELECT name FROM @excluded)
+  AND member.name NOT LIKE 'NT SERVICE%'
+  AND member.name NOT LIKE 'NT AUTHORITY%'
+ORDER BY role.name, member.name;
+
+-- Database users mapped to source logins
+SELECT
+    dp.name AS user_name,
+    dp.type_desc,
+    dp.authentication_type_desc,
+    dp.default_schema_name,
+    sp.name AS login_name,
+    'CREATE USER [' + dp.name + '] FOR LOGIN [' + ISNULL(sp.name, dp.name) + '] WITH DEFAULT_SCHEMA = [' + ISNULL(dp.default_schema_name, 'dbo') + '];' AS create_user_statement
+FROM sys.database_principals dp
+LEFT JOIN sys.server_principals sp ON dp.sid = sp.sid
+WHERE dp.type IN ('S','U','G')
+  AND dp.name NOT IN ('dbo','guest','INFORMATION_SCHEMA','sys')
+ORDER BY dp.name;
+
+-- Database permissions snapshot
+SELECT
+    usr.name AS user_name,
+    perm.permission_name,
+    perm.state_desc,
+    perm.class_desc,
+    OBJECT_SCHEMA_NAME(perm.major_id) AS object_schema,
+    OBJECT_NAME(perm.major_id) AS object_name,
+    'GRANT ' + perm.permission_name + ' ON ' + 
+      CASE perm.class_desc
+        WHEN 'SCHEMA' THEN 'SCHEMA::[' + OBJECT_SCHEMA_NAME(perm.major_id) + ']'
+        WHEN 'OBJECT_OR_COLUMN' THEN '[' + OBJECT_SCHEMA_NAME(perm.major_id) + '].[' + OBJECT_NAME(perm.major_id) + ']'
+        WHEN 'DATABASE' THEN 'DATABASE::[' + DB_NAME() + ']'
+        ELSE perm.class_desc + '::' + CAST(perm.major_id AS nvarchar(32))
+      END + ' TO [' + usr.name + ']' + CASE WHEN perm.state_desc = 'WITH GRANT OPTION' THEN ' WITH GRANT OPTION' ELSE '' END + ';' AS permission_statement
+FROM sys.database_permissions perm
+JOIN sys.database_principals usr ON perm.grantee_principal_id = usr.principal_id
+WHERE usr.type IN ('S','U','G')
+  AND usr.name NOT IN ('dbo','guest','INFORMATION_SCHEMA','sys')
+ORDER BY usr.name, perm.permission_name;

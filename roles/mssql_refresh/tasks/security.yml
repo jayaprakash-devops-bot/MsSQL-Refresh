@@ -1,0 +1,68 @@
+---
+- name: Security | Capture destination security snapshot
+  community.general.mssql_script:
+    login_host: "{{ mssql_refresh_target_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    login_port: "{{ dest_port | default(omit) }}"
+    name: "{{ mssql_refresh_target_database }}"
+    output: dict
+    script: "{{ lookup('ansible.builtin.template', role_path ~ '/templates/capture_security.sql.j2') }}"
+  register: mssql_refresh_security_snapshot
+  when: mssql_refresh_target_instance is defined
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+
+- name: Security | Shape snapshot results into facts
+  ansible.builtin.set_fact:
+    mssql_refresh_target_logins: "{{ mssql_refresh_security_snapshot.query_results_dict[0][0] | default([]) }}"
+    mssql_refresh_target_role_memberships: "{{ mssql_refresh_security_snapshot.query_results_dict[0][1] | default([]) }}"
+    mssql_refresh_target_db_users: "{{ mssql_refresh_security_snapshot.query_results_dict[0][2] | default([]) }}"
+    mssql_refresh_target_db_permissions: "{{ mssql_refresh_security_snapshot.query_results_dict[0][3] | default([]) }}"
+  when: mssql_refresh_security_snapshot is defined
+
+- name: Security | Build replayable security script payload
+  ansible.builtin.set_fact:
+    mssql_refresh_security_script_text: |
+      /* Server Logins */
+      {% for row in mssql_refresh_target_logins %}
+      {{ row.create_statement | default('-- ' + row.login_name + ' skipped') }}
+      {% endfor %}
+
+      /* Server Role Memberships */
+      {% for row in mssql_refresh_target_role_memberships %}
+      {{ row.add_member_statement }}
+      {% endfor %}
+
+      USE [{{ mssql_refresh_target_database }}];
+      GO
+      /* Database Users */
+      {% for row in mssql_refresh_target_db_users %}
+      {{ row.create_user_statement }}
+      {% endfor %}
+
+      /* Database Permissions */
+      {% for row in mssql_refresh_target_db_permissions %}
+      {{ row.permission_statement }}
+      {% endfor %}
+  when: mssql_refresh_security_snapshot is defined
+
+- name: Security | Save security script locally for auditing
+  ansible.builtin.copy:
+    dest: "{{ security_script_output | default('/tmp') }}/{{ inventory_hostname | regex_replace('[\\/:]', '_') }}_{{ mssql_refresh_target_database }}_security.sql"
+    content: "{{ mssql_refresh_security_script_text }}"
+  delegate_to: localhost
+  run_once: true
+  when:
+    - mssql_refresh_security_snapshot is defined
+    - security_script_output is defined
+
+- name: Security | Show security summary counts
+  ansible.builtin.debug:
+    msg:
+      logins_captured: "{{ mssql_refresh_target_logins | length }}"
+      role_memberships: "{{ mssql_refresh_target_role_memberships | length }}"
+      db_users: "{{ mssql_refresh_target_db_users | length }}"
+      db_permissions: "{{ mssql_refresh_target_db_permissions | length }}"
+  when: not ansible_check_mode

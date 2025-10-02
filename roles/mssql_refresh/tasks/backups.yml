@@ -1,0 +1,104 @@
+---
+- name: Backup | Discover backup chain from source
+  community.general.mssql_script:
+    login_host: "{{ mssql_refresh_source_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    login_port: "{{ src_port | default(omit) }}"
+    name: msdb
+    output: dict
+    script: "{{ lookup('ansible.builtin.template', role_path ~ '/templates/discover_backup_chain.sql.j2') }}"
+    params:
+      database: "{{ mssql_refresh_source_database }}"
+      lookback_hours: "{{ mssql_refresh_backup_lookback_hours }}"
+  register: mssql_refresh_backup_chain
+  when: mssql_refresh_source_instance is defined
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+
+- name: Backup | Shape backup chain data into facts
+  ansible.builtin.set_fact:
+    mssql_refresh_source_last_full: "{{ (mssql_refresh_backup_chain.query_results_dict[0][0] | default([])) | first | default({}) }}"
+    mssql_refresh_source_diffs: "{{ mssql_refresh_backup_chain.query_results_dict[0][1] | default([]) }}"
+    mssql_refresh_source_logs: "{{ mssql_refresh_backup_chain.query_results_dict[0][2] | default([]) }}"
+    mssql_refresh_source_backup_origins: "{{ mssql_refresh_backup_chain.query_results_dict[0][3] | default([]) }}"
+  when: mssql_refresh_backup_chain is defined
+
+- name: Backup | Derive backup plan metrics
+  ansible.builtin.set_fact:
+    mssql_refresh_has_full: "{{ (mssql_refresh_source_last_full | default({})) | length > 0 }}"
+    mssql_refresh_diff_count: "{{ mssql_refresh_source_diffs | default([]) | length }}"
+    mssql_refresh_log_count: "{{ mssql_refresh_source_logs | default([]) | length }}"
+
+- name: Backup | Initialize restore plan container
+  ansible.builtin.set_fact:
+    mssql_refresh_restore_plan: []
+
+- name: Backup | Plan full restore
+  ansible.builtin.set_fact:
+    mssql_refresh_restore_plan: "{{ mssql_refresh_restore_plan + [rest_step] }}"
+  vars:
+    media_paths: "{{ mssql_refresh_source_last_full.device_paths | default('') | split(';') | reject('equalto', '') | list }}"
+    restore_media: "{{ media_paths | map('regex_replace', '^(.*)$', "DISK = N'\\1'") | join(', ') }}"
+    rest_step:
+      step: 1
+      type: FULL
+      source_server: "{{ mssql_refresh_source_last_full.server_name | default('unknown') }}"
+      backup_finish: "{{ mssql_refresh_source_last_full.backup_finish_date | default('') }}"
+      command: "RESTORE DATABASE [{{ mssql_refresh_target_database }}] FROM {{ restore_media }} WITH NORECOVERY, REPLACE, STATS = 10;"
+  when: mssql_refresh_has_full
+
+- name: Backup | Plan differential restores
+  ansible.builtin.set_fact:
+    mssql_refresh_restore_plan: "{{ mssql_refresh_restore_plan + [rest_step] }}"
+  loop: "{{ mssql_refresh_source_diffs | default([]) }}"
+  loop_control:
+    index_var: diff_idx
+    label: "diff {{ item.backup_set_id | default('unknown') }}"
+  vars:
+    diff_media_paths: "{{ item.device_paths | default('') | split(';') | reject('equalto', '') | list }}"
+    diff_restore_media: "{{ diff_media_paths | map('regex_replace', '^(.*)$', "DISK = N'\\1'") | join(', ') }}"
+    rest_step:
+      step: "{{ (1 if mssql_refresh_has_full else 0) + diff_idx + 1 }}"
+      type: DIFFERENTIAL
+      source_server: "{{ item.server_name | default('unknown') }}"
+      backup_finish: "{{ item.backup_finish_date | default('') }}"
+      command: "RESTORE DATABASE [{{ mssql_refresh_target_database }}] FROM {{ diff_restore_media }} WITH NORECOVERY, STATS = 10;"
+  when: (mssql_refresh_source_diffs | default([])) | length > 0
+
+- name: Backup | Plan log restores
+  ansible.builtin.set_fact:
+    mssql_refresh_restore_plan: "{{ mssql_refresh_restore_plan + [rest_step] }}"
+  loop: "{{ mssql_refresh_source_logs | default([]) }}"
+  loop_control:
+    index_var: log_idx
+    label: "log {{ item.backup_set_id | default('unknown') }}"
+  vars:
+    log_media_paths: "{{ item.device_paths | default('') | split(';') | reject('equalto', '') | list }}"
+    log_restore_media: "{{ log_media_paths | map('regex_replace', '^(.*)$', "DISK = N'\\1'") | join(', ') }}"
+    rest_step:
+      step: "{{ (1 if mssql_refresh_has_full else 0) + (mssql_refresh_diff_count | default(0)) + log_idx + 1 }}"
+      type: LOG
+      source_server: "{{ item.server_name | default('unknown') }}"
+      backup_finish: "{{ item.backup_finish_date | default('') }}"
+      command: "RESTORE LOG [{{ mssql_refresh_target_database }}] FROM {{ log_restore_media }} WITH NORECOVERY, STATS = 10;"
+  when: (mssql_refresh_source_logs | default([])) | length > 0
+
+- name: Backup | Append recovery step
+  ansible.builtin.set_fact:
+    mssql_refresh_restore_plan: "{{ mssql_refresh_restore_plan + [rest_step] }}"
+  vars:
+    rest_step:
+      step: "{{ (mssql_refresh_restore_plan | length) + 1 }}"
+      type: RECOVERY
+      source_server: localhost
+      backup_finish: "{{ '%Y-%m-%dT%H:%M:%S' | strftime }}"
+      command: "RESTORE DATABASE [{{ mssql_refresh_target_database }}] WITH RECOVERY;"
+  when: mssql_refresh_has_full
+
+- name: Backup | Display backup origin insight
+  ansible.builtin.debug:
+    msg:
+      backup_sources: "{{ mssql_refresh_source_backup_origins }}"
+  when: not ansible_check_mode

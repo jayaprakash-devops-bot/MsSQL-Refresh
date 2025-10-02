@@ -1,11 +1,10 @@
-- name: MsSQL database refresh
-  hosts: "{{ ctrl_server }}"
-  gather_facts: true
+- name: MSSQL AG refresh preparation
+  hosts: "{{ ctrl_server | default('localhost') }}"
+  gather_facts: false
   vars:
-    dry_run: true
-    log_msg: "{{ '%Y-%m-%d %H:%M:%S' | strftime }} Starting the database restore/migration "  
-    paths_attach: []
-    ag_name: "No AG was defined"
-    isContained: false
+    mssql_refresh_use_cyberark: "{{ use_cyberark | default(true) }}"
+    mssql_refresh_require_credentials: true
+    mssql_refresh_backup_lookback_hours: "{{ backup_lookback_hours | default(72) }}"
+    security_script_output: "{{ security_script_output | default(omit) }}"
   roles:
-  - MsSQL_database_refresh
+    - MsSQL_database_refresh

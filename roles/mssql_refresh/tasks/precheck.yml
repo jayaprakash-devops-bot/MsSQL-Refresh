@@ -1,0 +1,65 @@
+---
+- name: Precheck | Validate source topology
+  community.general.mssql_script:
+    login_host: "{{ mssql_refresh_source_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    login_port: "{{ src_port | default(omit) }}"
+    name: master
+    output: dict
+    script: "{{ lookup('ansible.builtin.template', role_path ~ '/templates/precheck_topology.sql.j2') }}"
+    params:
+      database: "{{ mssql_refresh_source_database }}"
+      listener: "{{ mssql_refresh_source_listener | default('') }}"
+  when: mssql_refresh_source_instance is defined
+  register: mssql_refresh_source_precheck
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+
+- name: Precheck | Capture source topology facts
+  ansible.builtin.set_fact:
+    mssql_refresh_source_instance_info: "{{ mssql_refresh_source_precheck.query_results_dict[0][0][0] | default({}) }}"
+    mssql_refresh_source_replicas: "{{ mssql_refresh_source_precheck.query_results_dict[0][1] | default([]) }}"
+    mssql_refresh_source_summary: "{{ mssql_refresh_source_precheck.query_results_dict[0][2] | default([]) }}"
+    mssql_refresh_source_mirroring: "{{ mssql_refresh_source_precheck.query_results_dict[0][3] | default([]) }}"
+    mssql_refresh_source_log_shipping: "{{ mssql_refresh_source_precheck.query_results_dict[0][4] | default([]) }}"
+  when: mssql_refresh_source_precheck is defined
+
+- name: Precheck | Validate target topology
+  community.general.mssql_script:
+    login_host: "{{ mssql_refresh_target_instance }}"
+    login_user: "{{ sql_usr }}"
+    login_password: "{{ sql_pwd }}"
+    login_port: "{{ dest_port | default(omit) }}"
+    name: master
+    output: dict
+    script: "{{ lookup('ansible.builtin.template', role_path ~ '/templates/precheck_topology.sql.j2') }}"
+    params:
+      database: "{{ mssql_refresh_target_database }}"
+      listener: "{{ mssql_refresh_target_listener | default('') }}"
+  when: mssql_refresh_target_instance is defined
+  register: mssql_refresh_target_precheck
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+
+- name: Precheck | Capture target topology facts
+  ansible.builtin.set_fact:
+    mssql_refresh_target_instance_info: "{{ mssql_refresh_target_precheck.query_results_dict[0][0][0] | default({}) }}"
+    mssql_refresh_target_replicas: "{{ mssql_refresh_target_precheck.query_results_dict[0][1] | default([]) }}"
+    mssql_refresh_target_summary: "{{ mssql_refresh_target_precheck.query_results_dict[0][2] | default([]) }}"
+    mssql_refresh_target_mirroring: "{{ mssql_refresh_target_precheck.query_results_dict[0][3] | default([]) }}"
+    mssql_refresh_target_log_shipping: "{{ mssql_refresh_target_precheck.query_results_dict[0][4] | default([]) }}"
+  when: mssql_refresh_target_precheck is defined
+
+- name: Precheck | Emit diagnostic summary
+  ansible.builtin.debug:
+    msg:
+      source_primary: "{{ (mssql_refresh_source_summary | json_query('[?is_primary == `1`].replica_server_name') | first | default('unknown')) if mssql_refresh_source_summary is defined else 'n/a' }}"
+      source_secondaries: "{{ mssql_refresh_source_summary | json_query('[?is_secondary == `1`].replica_server_name') | default([]) }}"
+      target_primary: "{{ (mssql_refresh_target_summary | json_query('[?is_primary == `1`].replica_server_name') | first | default('unknown')) if mssql_refresh_target_summary is defined else 'n/a' }}"
+      target_secondaries: "{{ mssql_refresh_target_summary | json_query('[?is_secondary == `1`].replica_server_name') | default([]) }}"
+      source_backup_compression: "{{ mssql_refresh_source_instance_info.backup_compression_default | default(0) }}"
+      target_backup_compression: "{{ mssql_refresh_target_instance_info.backup_compression_default | default(0) }}"
+  when: not ansible_check_mode

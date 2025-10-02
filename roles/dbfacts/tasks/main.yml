@@ -1,4 +1,0 @@
-- name: GetDetails
-    debug:
-      msg: "Show test message"
-      verbosity: 2

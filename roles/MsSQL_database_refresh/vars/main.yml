@@ -1,0 +1,3 @@
+---
+mssql_refresh_use_cyberark: true
+mssql_refresh_require_credentials: true

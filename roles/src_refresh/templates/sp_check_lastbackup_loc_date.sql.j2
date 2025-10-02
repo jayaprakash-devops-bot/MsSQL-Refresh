@@ -1,5 +1,0 @@
-select  TOP(1) DATEDIFF(HOUR,backup_finish_date ,GETDATE()) as age_hours, b.physical_device_name,'Full' AS type,a.backup_finish_date
-from msdb.dbo.backupset a join msdb.dbo.backupmediafamily b
-  on a.media_set_id = b.media_set_id 
-WHERE a.[type] = 'D'  and a.database_name Like '{{src_database}}'
-order by a.backup_finish_date DESC  

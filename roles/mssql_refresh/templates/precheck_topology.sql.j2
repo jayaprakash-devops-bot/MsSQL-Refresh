@@ -1,0 +1,104 @@
+SET NOCOUNT ON;
+DECLARE @db sysname = %(database)s;
+DECLARE @listener sysname = NULLIF(%(listener)s, '');
+
+/* Instance level diagnostics */
+SELECT
+    SERVERPROPERTY('MachineName') AS machine_name,
+    SERVERPROPERTY('ServerName') AS server_name,
+    SERVERPROPERTY('InstanceName') AS instance_name,
+    SERVERPROPERTY('IsHadrEnabled') AS is_hadr_enabled,
+    SERVERPROPERTY('IsClustered') AS is_clustered,
+    SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS physical_node,
+    SERVERPROPERTY('ProductVersion') AS product_version,
+    SERVERPROPERTY('ProductLevel') AS product_level,
+    SERVERPROPERTY('Edition') AS edition,
+    CASE WHEN EXISTS (SELECT 1 FROM sys.availability_groups) THEN 1 ELSE 0 END AS ag_present,
+    CASE WHEN EXISTS (SELECT 1 FROM sys.availability_databases_cluster WHERE database_name = @db) THEN 1 ELSE 0 END AS database_in_ag,
+    CASE WHEN EXISTS (SELECT 1 FROM sys.database_mirroring WHERE mirroring_guid IS NOT NULL AND database_id = DB_ID(@db)) THEN 1 ELSE 0 END AS database_mirrored,
+    ISNULL((SELECT CAST(value_in_use AS INT) FROM sys.configurations WHERE name = 'backup compression default'),0) AS backup_compression_default,
+    DB_NAME(DB_ID(@db)) AS database_name;
+
+/* Availability replica level diagnostics */
+;WITH ag_members AS (
+    SELECT
+        ag.name AS ag_name,
+        ag.group_id,
+        ar.replica_server_name,
+        ar.replica_metadata_id,
+        ar.availability_mode_desc,
+        ar.failover_mode_desc,
+        ar.secondary_role_allow_connections_desc,
+        ar.backup_priority,
+        ars.role_desc,
+        ars.operational_state_desc,
+        ars.synchronization_health_desc,
+        ars.connected_state_desc,
+        ars.synchronization_state_desc,
+        agl.dns_name AS listener_name,
+        agl.port AS listener_port,
+        CASE WHEN adc.database_name IS NOT NULL THEN 1 ELSE 0 END AS database_attached
+    FROM sys.availability_groups ag
+    INNER JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+    LEFT JOIN sys.dm_hadr_availability_replica_states ars ON ar.group_id = ars.group_id AND ar.replica_id = ars.replica_id
+    LEFT JOIN sys.availability_group_listeners agl ON ag.group_id = agl.group_id
+    LEFT JOIN sys.availability_databases_cluster adc ON ag.group_id = adc.group_id AND adc.database_name = @db
+)
+SELECT *
+FROM ag_members
+WHERE database_attached = 1
+   OR (@listener IS NOT NULL AND (listener_name = @listener OR listener_name + ':' + CAST(listener_port AS NVARCHAR(5)) = @listener));
+
+/* Primary/secondary identification summary */
+SELECT 
+    ag.name AS ag_name,
+    ars.role_desc,
+    ar.replica_server_name,
+    CASE WHEN adc.database_name IS NOT NULL THEN 1 ELSE 0 END AS database_attached,
+    CASE WHEN ars.role_desc = 'PRIMARY' THEN 1 ELSE 0 END AS is_primary,
+    CASE WHEN ars.role_desc = 'SECONDARY' THEN 1 ELSE 0 END AS is_secondary,
+    CASE WHEN ars.secondary_lag_seconds IS NOT NULL THEN ars.secondary_lag_seconds ELSE 0 END AS secondary_lag_seconds,
+    agl.dns_name AS listener_name
+FROM sys.availability_groups ag
+INNER JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+LEFT JOIN sys.dm_hadr_availability_replica_states ars ON ar.group_id = ars.group_id AND ar.replica_id = ars.replica_id
+LEFT JOIN sys.availability_group_listeners agl ON ag.group_id = agl.group_id
+LEFT JOIN sys.availability_databases_cluster adc ON ag.group_id = adc.group_id AND adc.database_name = @db
+WHERE adc.database_name IS NOT NULL;
+
+/* Database mirroring (legacy HA) overview */
+SELECT 
+    DB_NAME(dm.database_id) AS database_name,
+    dm.mirroring_state_desc,
+    dm.mirroring_role_desc,
+    dm.mirroring_safety_level_desc,
+    dm.mirroring_partner_instance,
+    dm.mirroring_partner_name
+FROM sys.database_mirroring dm
+WHERE dm.database_id = DB_ID(@db)
+  AND dm.mirroring_guid IS NOT NULL;
+
+/* Log shipping configuration overview */
+SELECT
+    ls.primary_server,
+    ls.primary_database,
+    ls.secondary_server,
+    ls.secondary_database,
+    ls.restore_delay,
+    ls.monitor_server,
+    ls.monitor_server_security_mode,
+    'primary' AS role
+FROM msdb.dbo.log_shipping_primary_databases ls
+WHERE ls.primary_database = @db
+UNION ALL
+SELECT
+    ls.primary_server,
+    ls.primary_database,
+    ls.secondary_server,
+    ls.secondary_database,
+    ls.restore_delay,
+    ls.monitor_server,
+    ls.monitor_server_security_mode,
+    'secondary' AS role
+FROM msdb.dbo.log_shipping_secondary_databases ls
+WHERE ls.secondary_database = @db;

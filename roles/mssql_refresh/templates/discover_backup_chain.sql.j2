@@ -1,0 +1,190 @@
+SET NOCOUNT ON;
+DECLARE @source_db sysname = %(database)s;
+DECLARE @lookback_hours int = %(lookback_hours)s;
+IF @lookback_hours IS NULL OR @lookback_hours < 1 SET @lookback_hours = 72;
+DECLARE @window_start datetime2 = DATEADD(HOUR, -@lookback_hours, SYSUTCDATETIME());
+
+-- Last full backup metadata and files
+;WITH LastFull AS (
+    SELECT TOP (1)
+        bs.backup_set_id,
+        bs.media_set_id,
+        bs.backup_start_date,
+        bs.backup_finish_date,
+        bs.server_name,
+        bs.machine_name,
+        bs.first_lsn,
+        bs.last_lsn,
+        bs.database_backup_lsn,
+        bs.recovery_model,
+        bs.is_copy_only
+    FROM msdb.dbo.backupset bs
+    WHERE bs.database_name = @source_db
+      AND bs.type = 'D'
+    ORDER BY bs.backup_finish_date DESC
+), FullDevices AS (
+    SELECT 
+        lf.backup_set_id,
+        STUFF((
+            SELECT ';' + bm.physical_device_name
+            FROM msdb.dbo.backupmediafamily bm
+            WHERE bm.media_set_id = lf.media_set_id
+            ORDER BY bm.family_sequence_number
+            FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'),1,1,'') AS device_paths
+    FROM LastFull lf
+)
+SELECT 
+    lf.backup_set_id,
+    lf.backup_start_date,
+    lf.backup_finish_date,
+    lf.server_name,
+    lf.machine_name,
+    lf.first_lsn,
+    lf.last_lsn,
+    lf.database_backup_lsn,
+    lf.recovery_model,
+    lf.is_copy_only,
+    fd.device_paths
+FROM LastFull lf
+LEFT JOIN FullDevices fd ON lf.backup_set_id = fd.backup_set_id;
+
+-- Differential backups tied to last full
+;WITH LastFull AS (
+    SELECT TOP (1)
+        bs.database_backup_lsn,
+        bs.backup_finish_date
+    FROM msdb.dbo.backupset bs
+    WHERE bs.database_name = @source_db
+      AND bs.type = 'D'
+    ORDER BY bs.backup_finish_date DESC
+), DiffBackups AS (
+    SELECT 
+        bs.backup_set_id,
+        bs.media_set_id,
+        bs.backup_start_date,
+        bs.backup_finish_date,
+        bs.server_name,
+        bs.machine_name,
+        bs.first_lsn,
+        bs.last_lsn,
+        bs.database_backup_lsn,
+        bs.differential_base_lsn,
+        bs.is_copy_only
+    FROM msdb.dbo.backupset bs
+    CROSS JOIN LastFull lf
+    WHERE bs.database_name = @source_db
+      AND bs.type = 'I'
+      AND bs.database_backup_lsn = lf.database_backup_lsn
+      AND bs.backup_finish_date >= lf.backup_finish_date
+), DiffDevices AS (
+    SELECT 
+        db.backup_set_id,
+        STUFF((
+            SELECT ';' + bm.physical_device_name
+            FROM msdb.dbo.backupmediafamily bm
+            WHERE bm.media_set_id = db.media_set_id
+            ORDER BY bm.family_sequence_number
+            FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'),1,1,'') AS device_paths
+    FROM DiffBackups db
+)
+SELECT 
+    db.backup_set_id,
+    db.backup_start_date,
+    db.backup_finish_date,
+    db.server_name,
+    db.machine_name,
+    db.first_lsn,
+    db.last_lsn,
+    db.database_backup_lsn,
+    db.differential_base_lsn,
+    db.is_copy_only,
+    dd.device_paths
+FROM DiffBackups db
+LEFT JOIN DiffDevices dd ON db.backup_set_id = dd.backup_set_id
+ORDER BY db.backup_finish_date;
+
+-- Transaction log backups after the most recent differential or full
+;WITH LastFull AS (
+    SELECT TOP (1)
+        bs.database_backup_lsn,
+        bs.last_lsn,
+        bs.backup_finish_date
+    FROM msdb.dbo.backupset bs
+    WHERE bs.database_name = @source_db
+      AND bs.type = 'D'
+    ORDER BY bs.backup_finish_date DESC
+), LastDiff AS (
+    SELECT TOP (1)
+        bs.database_backup_lsn,
+        bs.last_lsn,
+        bs.backup_finish_date
+    FROM msdb.dbo.backupset bs
+    CROSS JOIN LastFull lf
+    WHERE bs.database_name = @source_db
+      AND bs.type = 'I'
+      AND bs.database_backup_lsn = lf.database_backup_lsn
+    ORDER BY bs.backup_finish_date DESC
+), BaseLsn AS (
+    SELECT 
+        lf.database_backup_lsn,
+        COALESCE(ld.last_lsn, lf.last_lsn) AS last_lsn,
+        COALESCE(ld.backup_finish_date, lf.backup_finish_date) AS backup_finish_date
+    FROM LastFull lf
+    LEFT JOIN LastDiff ld ON ld.database_backup_lsn = lf.database_backup_lsn
+), LogBackups AS (
+    SELECT 
+        bs.backup_set_id,
+        bs.media_set_id,
+        bs.backup_start_date,
+        bs.backup_finish_date,
+        bs.server_name,
+        bs.machine_name,
+        bs.first_lsn,
+        bs.last_lsn,
+        bs.database_backup_lsn,
+        bs.is_copy_only
+    FROM msdb.dbo.backupset bs
+    CROSS JOIN BaseLsn bl
+    WHERE bs.database_name = @source_db
+      AND bs.type = 'L'
+      AND bs.backup_start_date >= bl.backup_finish_date
+      AND bs.last_lsn > bl.last_lsn
+), LogDevices AS (
+    SELECT 
+        lb.backup_set_id,
+        STUFF((
+            SELECT ';' + bm.physical_device_name
+            FROM msdb.dbo.backupmediafamily bm
+            WHERE bm.media_set_id = lb.media_set_id
+            ORDER BY bm.family_sequence_number
+            FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'),1,1,'') AS device_paths
+    FROM LogBackups lb
+)
+SELECT 
+    lb.backup_set_id,
+    lb.backup_start_date,
+    lb.backup_finish_date,
+    lb.server_name,
+    lb.machine_name,
+    lb.first_lsn,
+    lb.last_lsn,
+    lb.database_backup_lsn,
+    lb.is_copy_only,
+    ld.device_paths
+FROM LogBackups lb
+LEFT JOIN LogDevices ld ON lb.backup_set_id = ld.backup_set_id
+ORDER BY lb.backup_finish_date;
+
+-- Source servers involved in recent backups for cross-replica awareness
+SELECT DISTINCT
+    bs.server_name,
+    bs.machine_name,
+    MIN(bs.backup_start_date) AS first_seen,
+    MAX(bs.backup_finish_date) AS last_seen,
+    MIN(bs.type) AS first_type,
+    MAX(bs.type) AS last_type
+FROM msdb.dbo.backupset bs
+WHERE bs.database_name = @source_db
+  AND bs.backup_start_date >= @window_start
+GROUP BY bs.server_name, bs.machine_name
+ORDER BY last_seen DESC;
